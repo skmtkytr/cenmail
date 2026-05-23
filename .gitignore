@@ -4,3 +4,5 @@ dist
 *.log
 .env
 .env.local
+.env.op
+!.env.op.example
