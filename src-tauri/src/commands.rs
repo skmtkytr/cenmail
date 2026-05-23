@@ -17,9 +17,9 @@ use crate::{
     oauth, secret,
 };
 
-const SYNC_PARALLEL: usize = 4;
+const SYNC_PARALLEL: usize = 8;
 const SYNC_BATCH: usize = 100;
-const SYNC_PROGRESS_EVERY: usize = 100;
+const SYNC_PROGRESS_EVERY: usize = 50;
 const AUTH_RETRY_DELAY: Duration = Duration::from_millis(500);
 const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_millis(800);
 
@@ -191,13 +191,36 @@ pub async fn sync_account(
     state: State<'_, AppState>,
     email: String,
 ) -> Result<usize, String> {
-    let ids = with_token(&state, &email, |http, token| {
-        Box::pin(gmail::messages::list_all_message_ids(http, token))
+    // If we already have messages for this account, ask Gmail only for
+    // anything newer than the freshest one we know about (with a 1-hour
+    // safety buffer for clock skew / late deliveries). This turns the
+    // background sync into a few-second incremental query instead of a
+    // full pageToken walk of every message in the mailbox.
+    let after_seconds: Option<i64> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let max_ms: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(date_millis) FROM messages WHERE account_email = ?1",
+                params![email],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        max_ms.map(|ms| (ms / 1000) - 3600)
+    };
+    let query = after_seconds.map(|s| format!("after:{s}"));
+    let query_param = query.clone();
+
+    let all_ids = with_token(&state, &email, |http, token| {
+        let q = query_param.clone();
+        Box::pin(async move {
+            gmail::messages::list_message_ids(http, token, q.as_deref()).await
+        })
     })
     .await
     .map_err(|e| {
         let msg = format!("list ids: {e:#}");
-        tracing::error!(%email, error = %msg, "sync: list_all failed");
+        tracing::error!(%email, error = %msg, "sync: list failed");
         let _ = app.emit(
             "sync:error",
             &SyncError {
@@ -207,8 +230,29 @@ pub async fn sync_account(
         );
         msg
     })?;
+    tracing::info!(%email, query = ?query, listed = all_ids.len(), "sync: listed ids");
+
+    // Skip IDs we've already fetched. `messages.list` returns newest-first, so
+    // preserving order in the resulting Vec keeps the fresh stuff at the front
+    // for `buffered` to emit first.
+    let ids: Vec<String> = {
+        use std::collections::HashSet;
+        let known: HashSet<String> = {
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare("SELECT id FROM messages WHERE account_email = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows: rusqlite::Result<HashSet<String>> = stmt
+                .query_map(params![email], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect();
+            rows.map_err(|e| e.to_string())?
+        };
+        all_ids.into_iter().filter(|id| !known.contains(id)).collect()
+    };
 
     let total = ids.len();
+    tracing::info!(%email, total, "sync: fetching new messages");
     let _ = app.emit(
         "sync:progress",
         &SyncProgress {
@@ -217,6 +261,17 @@ pub async fn sync_account(
             total,
         },
     );
+
+    if total == 0 {
+        let _ = app.emit(
+            "sync:done",
+            &SyncDone {
+                email: email.clone(),
+                total,
+            },
+        );
+        return Ok(0);
+    }
 
     let mut buf: Vec<MessageMeta> = Vec::with_capacity(SYNC_BATCH);
     let mut fetched = 0usize;
@@ -234,7 +289,7 @@ pub async fn sync_account(
             let email = email_owned.clone();
             async move { fetch_metadata_with_retry(&http, &cache, &config, &email, &id).await }
         })
-        .buffer_unordered(SYNC_PARALLEL);
+        .buffered(SYNC_PARALLEL);
 
     while let Some(item) = stream.next().await {
         if let Some(meta) = item {

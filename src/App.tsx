@@ -263,6 +263,23 @@ function App() {
     void loadMessages(selectedAccount(), selectedFolder(), debouncedSearch());
   }
 
+  // Reload the visible list at most once per `LIST_RELOAD_DEBOUNCE_MS` while
+  // a sync is streaming progress events. Without debounce we'd thrash the DB
+  // on every batch.
+  const LIST_RELOAD_DEBOUNCE_MS = 1500;
+  let listReloadTimer: number | undefined;
+  function scheduleListReload() {
+    if (listReloadTimer !== undefined) return;
+    listReloadTimer = window.setTimeout(() => {
+      listReloadTimer = undefined;
+      void loadMessages(
+        selectedAccount(),
+        selectedFolder(),
+        debouncedSearch(),
+      );
+    }, LIST_RELOAD_DEBOUNCE_MS);
+  }
+
   async function startSync(email: string) {
     setSyncState(email, {
       fetched: 0,
@@ -395,6 +412,7 @@ function App() {
         setSyncState(email, "fetched", fetched);
         setSyncState(email, "total", total);
         setSyncState(email, "status", "syncing");
+        scheduleListReload();
       }),
     );
     unlistenFns.push(

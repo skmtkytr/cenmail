@@ -76,11 +76,19 @@ pub struct MessageDetail {
     pub text_body: Option<String>,
 }
 
-pub async fn list_all_message_ids(http: &Client, access_token: &str) -> Result<Vec<String>> {
+pub async fn list_message_ids(
+    http: &Client,
+    access_token: &str,
+    query: Option<&str>,
+) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
         let mut url = format!("{BASE}/users/me/messages?maxResults=500");
+        if let Some(q) = query {
+            url.push_str("&q=");
+            url.push_str(&urlencoding::encode(q));
+        }
         if let Some(t) = &page_token {
             url.push_str("&pageToken=");
             url.push_str(t);
