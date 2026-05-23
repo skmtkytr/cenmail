@@ -150,7 +150,10 @@ export function MessagePreview(props: {
               </div>
             </div>
           </header>
-          <div class="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <div
+            class="flex min-h-0 flex-1 flex-col overflow-y-auto"
+            style={{ "will-change": "scroll-position" }}
+          >
             <For each={props.threadDetails}>
               {(d, i) => {
                 const expanded = () => props.expandedInThread.has(d.id);
@@ -169,6 +172,7 @@ export function MessagePreview(props: {
                     class={`flex flex-col border-b border-[color:var(--color-border)] ${
                       fillsRemaining() ? "min-h-0 flex-1" : "shrink-0"
                     }`}
+                    style={{ contain: "layout paint" }}
                   >
                     <header
                       onClick={() => props.toggleThreadExpanded(d.id)}
@@ -257,6 +261,10 @@ export function MessagePreview(props: {
                                 ? "bg-[color:var(--color-surface)]"
                                 : "bg-white"
                             }`}
+                            style={{
+                              transform: "translateZ(0)",
+                              "will-change": "transform",
+                            }}
                             title="message body"
                           />
                         </Show>

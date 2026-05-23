@@ -92,7 +92,10 @@ pub async fn list_message_ids(
     let mut ids = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
-        let mut url = format!("{BASE}/users/me/messages?maxResults=500");
+        // includeSpamTrash=true so the Spam folder stays in sync (without it
+        // Gmail excludes SPAM and TRASH labels by default).
+        let mut url =
+            format!("{BASE}/users/me/messages?maxResults=500&includeSpamTrash=true");
         if let Some(q) = query {
             url.push_str("&q=");
             url.push_str(&urlencoding::encode(q));

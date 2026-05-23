@@ -276,6 +276,33 @@ pub async fn create_event(
         .context("parse create event")?)
 }
 
+pub async fn update_event(
+    http: &Client,
+    access_token: &str,
+    calendar_id: &str,
+    event_id: &str,
+    input: &CreateEventInput,
+) -> Result<GCalEvent> {
+    let url = format!(
+        "{BASE}/calendars/{}/events/{}?sendUpdates=externalOnly",
+        urlencoding::encode(calendar_id),
+        urlencoding::encode(event_id),
+    );
+    let body = build_event_body(input)?;
+    Ok(http
+        .patch(&url)
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .context("update event request")?
+        .error_for_status()
+        .context("update event status")?
+        .json::<GCalEvent>()
+        .await
+        .context("parse update event")?)
+}
+
 pub async fn delete_event(
     http: &Client,
     access_token: &str,

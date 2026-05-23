@@ -1,6 +1,7 @@
 import { For, Show, createSignal } from "solid-js";
 import type { Account, ComposeState } from "./types";
 import { snoozePresets } from "./types";
+import { useEscClose } from "./modal";
 
 export function ComposeModal(props: {
   compose: ComposeState | null;
@@ -12,6 +13,7 @@ export function ComposeModal(props: {
   onUpdate: <K extends keyof ComposeState>(key: K, value: ComposeState[K]) => void;
 }) {
   const [scheduleMenuOpen, setScheduleMenuOpen] = createSignal(false);
+  useEscClose(() => props.compose !== null, () => props.onClose());
   return (
     <Show when={props.compose}>
       {(cs) => (

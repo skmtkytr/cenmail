@@ -1,4 +1,25 @@
-import { Show, createSignal } from "solid-js";
+import { Show, createEffect, createSignal, onCleanup } from "solid-js";
+
+/**
+ * Close a modal on Escape. Registered at document level with capture phase so
+ * the modal's handler beats the global App-level shortcuts handler. Pass an
+ * `active` accessor (e.g. `() => props.open`) — when it becomes true the
+ * listener attaches, when false the cleanup detaches it.
+ */
+export function useEscClose(active: () => boolean, onClose: () => void) {
+  createEffect(() => {
+    if (!active()) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      onClose();
+    };
+    document.addEventListener("keydown", onEsc, true);
+    onCleanup(() => document.removeEventListener("keydown", onEsc, true));
+  });
+}
 
 export type ConfirmOptions = {
   title: string;
@@ -28,6 +49,7 @@ function close(ok: boolean) {
 }
 
 export function ConfirmHost() {
+  useEscClose(() => pending() !== null, () => close(false));
   return (
     <Show when={pending()}>
       {(p) => (
@@ -35,7 +57,6 @@ export function ConfirmHost() {
           class="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4"
           onClick={() => close(false)}
           onKeyDown={(e) => {
-            if (e.key === "Escape") close(false);
             if (e.key === "Enter") close(true);
           }}
         >

@@ -1,5 +1,6 @@
 import { For, Show } from "solid-js";
 import { snoozePresets, type MessageMeta } from "./types";
+import { useEscClose } from "./modal";
 
 export type TriageActions = {
   toggleRead: (m: MessageMeta) => void;
@@ -28,6 +29,7 @@ export function ContextMenu(props: {
   onClose: () => void;
   actions: TriageActions;
 }) {
+  useEscClose(() => props.menu !== null, () => props.onClose());
   return (
     <Show when={props.menu}>
       {(cm) => {

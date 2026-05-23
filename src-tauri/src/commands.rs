@@ -1601,6 +1601,103 @@ pub async fn create_event(
     Ok(ev.id)
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateEventRequest {
+    pub email: String,
+    pub calendar_id: String,
+    pub event_id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    #[serde(default)]
+    pub all_day: bool,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
+}
+
+#[tauri::command]
+pub async fn update_event(
+    state: State<'_, AppState>,
+    request: UpdateEventRequest,
+) -> Result<(), String> {
+    let cid_owned = request.calendar_id.clone();
+    let eid_owned = request.event_id.clone();
+    let input = gcal::events::CreateEventInput {
+        summary: request.summary.clone(),
+        description: request.description.clone(),
+        location: request.location.clone(),
+        start_ms: request.start_ms,
+        end_ms: request.end_ms,
+        all_day: request.all_day,
+        attendees: request.attendees.clone(),
+        time_zone: request.time_zone.clone(),
+    };
+    let _ = with_token(&state, &request.email, move |http, token| {
+        let cid = cid_owned.clone();
+        let eid = eid_owned.clone();
+        let inp = gcal::events::CreateEventInput {
+            summary: input.summary.clone(),
+            description: input.description.clone(),
+            location: input.location.clone(),
+            start_ms: input.start_ms,
+            end_ms: input.end_ms,
+            all_day: input.all_day,
+            attendees: input.attendees.clone(),
+            time_zone: input.time_zone.clone(),
+        };
+        Box::pin(async move {
+            gcal::events::update_event(http, token, &cid, &eid, &inp).await
+        })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "update_event failed");
+        format!("{e:#}")
+    })?;
+    // Drop cached row; the next list_events_cached call will pick the fresh
+    // copy once sync_calendar_events repopulates it.
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "DELETE FROM events WHERE account_email = ?1 AND calendar_id = ?2 AND id = ?3",
+        params![request.email, request.calendar_id, request.event_id],
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_event(
+    state: State<'_, AppState>,
+    email: String,
+    calendar_id: String,
+    event_id: String,
+) -> Result<(), String> {
+    let cid_owned = calendar_id.clone();
+    let eid_owned = event_id.clone();
+    let _ = with_token(&state, &email, move |http, token| {
+        let cid = cid_owned.clone();
+        let eid = eid_owned.clone();
+        Box::pin(async move { gcal::events::delete_event(http, token, &cid, &eid).await })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "delete_event failed");
+        format!("{e:#}")
+    })?;
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "DELETE FROM events WHERE account_email = ?1 AND calendar_id = ?2 AND id = ?3",
+        params![email, calendar_id, event_id],
+    );
+    Ok(())
+}
+
 // Called from the timer task — runs the same logic as the user-initiated
 // unsnooze, but without an AppHandle for event emission and using anyhow
 // errors instead of String to play nice with the timer plumbing.

@@ -1,6 +1,7 @@
 import { For, Show } from "solid-js";
 import type { Bucket } from "./utils";
 import { settings, updateSettings, type ThemeMode } from "./settings";
+import { useEscClose } from "./modal";
 
 type AccountLike = { id: number; email: string };
 
@@ -23,6 +24,7 @@ export function SettingsModal(props: {
   onClose: () => void;
   accounts: AccountLike[];
 }) {
+  useEscClose(() => props.open, () => props.onClose());
   function toggleBucket(b: Bucket) {
     updateSettings((s) => {
       const present = s.notifications.buckets.includes(b);

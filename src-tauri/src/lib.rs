@@ -13,12 +13,12 @@ use rusqlite::params;
 use tauri::Manager;
 
 use commands::{
-    add_account, cancel_scheduled, create_event, get_message, get_thread, list_accounts,
-    list_calendars, list_events_cached, list_messages, list_scheduled, list_snoozed,
-    modify_message, mute_thread, refresh_account, remove_account, respond_to_event,
-    respond_to_invite, schedule_send, send_message, snooze_message, sync_account,
-    sync_calendar_events, trash_message, unmute_thread, unsnooze_message, untrash_message,
-    AppState,
+    add_account, cancel_scheduled, create_event, delete_event, get_message, get_thread,
+    list_accounts, list_calendars, list_events_cached, list_messages, list_scheduled,
+    list_snoozed, modify_message, mute_thread, refresh_account, remove_account,
+    respond_to_event, respond_to_invite, schedule_send, send_message, snooze_message,
+    sync_account, sync_calendar_events, trash_message, unmute_thread, unsnooze_message,
+    untrash_message, update_event, AppState,
 };
 
 const TIMER_TICK: Duration = Duration::from_secs(60);
@@ -101,6 +101,8 @@ pub fn run() {
             respond_to_event,
             respond_to_invite,
             create_event,
+            update_event,
+            delete_event,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

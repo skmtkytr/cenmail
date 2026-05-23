@@ -1,4 +1,5 @@
 import { For, Show } from "solid-js";
+import { useEscClose } from "./modal";
 
 type Entry = {
   combo: string[];
@@ -44,6 +45,7 @@ export function ShortcutsHelpModal(props: {
   open: boolean;
   onClose: () => void;
 }) {
+  useEscClose(() => props.open, () => props.onClose());
   return (
     <Show when={props.open}>
       <div

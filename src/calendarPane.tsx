@@ -13,6 +13,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { colorForEmail } from "./utils";
 import { showToast } from "./toast";
 import { settings, updateSettings } from "./settings";
+import { useEscClose } from "./modal";
 
 type CalendarRow = {
   account_email: string;
@@ -417,6 +418,66 @@ export function CalendarPane(props: { accounts: Account[] }) {
   });
 
   const [pickerOpen, setPickerOpen] = createSignal(false);
+  const [editorDraft, setEditorDraft] = createSignal<EventDraft | null>(null);
+
+  function openNewEventEditor() {
+    // Default to 1-hour event starting on the next half-hour mark, on the
+    // current anchor date.
+    const base = new Date(anchorDate());
+    base.setMinutes(base.getMinutes() < 30 ? 30 : 0, 0, 0);
+    if (base.getMinutes() === 0) base.setHours(base.getHours() + 1);
+    const startMs = base.getTime();
+    setEditorDraft({
+      summary: "",
+      description: "",
+      location: "",
+      start_ms: startMs,
+      end_ms: startMs + 60 * 60 * 1000,
+      all_day: false,
+      attendees: "",
+    });
+  }
+
+  function openEditEventEditor(ev: EventRow) {
+    let attendees: string[] = [];
+    try {
+      const parsed = JSON.parse(ev.attendees_json) as Array<{ email: string; self?: boolean }>;
+      attendees = parsed.filter((a) => !a.self).map((a) => a.email);
+    } catch {}
+    setEditorDraft({
+      account_email: ev.account_email,
+      calendar_id: ev.calendar_id,
+      event_id: ev.id,
+      summary: ev.summary || "",
+      description: ev.description || "",
+      location: ev.location || "",
+      start_ms: ev.start_ms,
+      end_ms: ev.end_ms,
+      all_day: ev.all_day,
+      attendees: attendees.join(", "),
+    });
+  }
+
+  async function deleteEvent(ev: EventRow) {
+    if (
+      !window.confirm(`Delete "${ev.summary || "(no title)"}"? This cannot be undone.`)
+    ) {
+      return;
+    }
+    try {
+      await invoke("delete_event", {
+        email: ev.account_email,
+        calendarId: ev.calendar_id,
+        eventId: ev.id,
+      });
+      showToast({ message: "Event deleted" });
+      setSelectedEvent(null);
+      void refetchEvents();
+      void syncWindow();
+    } catch (err) {
+      showToast({ message: `Delete failed: ${err}`, variant: "error" });
+    }
+  }
 
   async function refetchEvents() {
     try {
@@ -586,6 +647,14 @@ export function CalendarPane(props: { accounts: Account[] }) {
               </button>
             </div>
           </Show>
+          <button
+            type="button"
+            onClick={openNewEventEditor}
+            title="Create event"
+            class="rounded bg-[color:var(--color-accent)] px-2 py-0.5 text-xs font-medium text-white hover:opacity-90"
+          >
+            + New
+          </button>
           <div class="relative">
             <button
               type="button"
@@ -629,6 +698,17 @@ export function CalendarPane(props: { accounts: Account[] }) {
           hourPx={hourPx()}
           onZoomWheel={onZoomWheel}
           onSelectEvent={(ev) => setSelectedEvent(ev)}
+          onCreateRange={(startMs, endMs) => {
+            setEditorDraft({
+              summary: "",
+              description: "",
+              location: "",
+              start_ms: startMs,
+              end_ms: endMs,
+              all_day: false,
+              attendees: "",
+            });
+          }}
           eventStyle={eventStyle}
         />
       </Show>
@@ -657,6 +737,22 @@ export function CalendarPane(props: { accounts: Account[] }) {
               void refetchEvents();
               void syncWindow();
             }}
+            onEdit={() => openEditEventEditor(ev())}
+            onDelete={() => deleteEvent(ev())}
+          />
+        )}
+      </Show>
+      <Show when={editorDraft()}>
+        {(d) => (
+          <EventEditorModal
+            draft={d()}
+            accounts={props.accounts}
+            calendars={calendars() ?? []}
+            onClose={() => setEditorDraft(null)}
+            onSaved={() => {
+              void refetchEvents();
+              void syncWindow();
+            }}
           />
         )}
       </Show>
@@ -671,8 +767,68 @@ function TimeGridView(props: {
   hourPx: number;
   onZoomWheel: (e: WheelEvent) => void;
   onSelectEvent: (ev: EventRow) => void;
+  onCreateRange: (startMs: number, endMs: number) => void;
   eventStyle: (ev: EventRow) => EventStyle;
 }) {
+  type DragState = {
+    dayIndex: number;
+    dayMs: number;
+    startY: number;
+    currentY: number;
+  };
+  const [drag, setDrag] = createSignal<DragState | null>(null);
+  const SNAP_MIN = 15;
+
+  const pxToMinutes = (y: number): number => {
+    const raw = (y / props.hourPx) * 60;
+    return Math.max(0, Math.min(24 * 60, Math.round(raw / SNAP_MIN) * SNAP_MIN));
+  };
+
+  function startDrag(e: MouseEvent, di: number, dayMs: number) {
+    // Only start a drag on the column background, not on an event button.
+    if (e.target !== e.currentTarget) return;
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const colEl = e.currentTarget as HTMLElement;
+    const rect = colEl.getBoundingClientRect();
+    const y0 = e.clientY - rect.top;
+    setDrag({ dayIndex: di, dayMs, startY: y0, currentY: y0 });
+    const onMove = (mv: MouseEvent) => {
+      const r = colEl.getBoundingClientRect();
+      const y = Math.max(0, Math.min(r.height, mv.clientY - r.top));
+      setDrag((s) => (s ? { ...s, currentY: y } : null));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      const s = drag();
+      setDrag(null);
+      if (!s) return;
+      let startMin = pxToMinutes(Math.min(s.startY, s.currentY));
+      let endMin = pxToMinutes(Math.max(s.startY, s.currentY));
+      if (endMin - startMin < SNAP_MIN) endMin = startMin + 60; // click → 1h
+      props.onCreateRange(
+        s.dayMs + startMin * 60_000,
+        s.dayMs + endMin * 60_000,
+      );
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function dragRect(di: number): { top: number; height: number; label: string } | null {
+    const s = drag();
+    if (!s || s.dayIndex !== di) return null;
+    const yMin = Math.min(s.startY, s.currentY);
+    const yMax = Math.max(s.startY, s.currentY);
+    const startMin = pxToMinutes(yMin);
+    const endMin = Math.max(startMin + SNAP_MIN, pxToMinutes(yMax));
+    const top = (startMin / 60) * props.hourPx;
+    const height = ((endMin - startMin) / 60) * props.hourPx;
+    const fmt = (m: number) =>
+      `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+    return { top, height, label: `${fmt(startMin)} – ${fmt(endMin)}` };
+  }
   const days = createMemo(() =>
     Array.from({ length: props.dayCount }, (_, i) =>
       new Date(props.startMs + i * ONE_DAY_MS),
@@ -828,13 +984,29 @@ function TimeGridView(props: {
           <For each={days()}>
             {(d, di) => (
               <div
-                class="relative flex-1 border-l border-[color:var(--color-border)]"
+                class="relative flex-1 cursor-cell border-l border-[color:var(--color-border)]"
                 style={{
                   height: `${props.hourPx * 24}px`,
                   "background-image": `repeating-linear-gradient(to bottom, transparent 0, transparent ${props.hourPx - 1}px, var(--color-border) ${props.hourPx - 1}px, var(--color-border) ${props.hourPx}px)`,
                   contain: "layout style paint",
                 }}
+                onMouseDown={(e) => startDrag(e, di(), d.getTime())}
               >
+                <Show when={dragRect(di())}>
+                  {(r) => (
+                    <div
+                      class="pointer-events-none absolute inset-x-0.5 rounded border border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/30"
+                      style={{
+                        top: `${r().top}px`,
+                        height: `${r().height}px`,
+                      }}
+                    >
+                      <span class="m-1 inline-block rounded bg-[color:var(--color-accent)] px-1 text-[10px] font-medium text-white">
+                        {r().label}
+                      </span>
+                    </div>
+                  )}
+                </Show>
                 <For each={timedByDay()[di()]}>
                   {(ev) => {
                     const dayStartMs = d.getTime();
@@ -870,7 +1042,7 @@ function TimeGridView(props: {
                       <button
                         type="button"
                         onClick={() => props.onSelectEvent(ev)}
-                        class={`absolute flex flex-col items-start justify-start overflow-hidden rounded px-1.5 py-0.5 text-left text-xs leading-tight shadow-sm ${
+                        class={`absolute flex flex-col items-start justify-start overflow-hidden rounded px-1.5 py-0.5 text-left text-xs leading-tight ${
                           declined ? "opacity-50 line-through" : ""
                         }`}
                         style={{
@@ -1093,6 +1265,361 @@ function MonthWeekRow(props: {
   );
 }
 
+export type EventDraft = {
+  // If both account_email + calendar_id + event_id are set, this is an edit.
+  // Otherwise it's a new event (calendar_id+account picked from form).
+  account_email?: string;
+  calendar_id?: string;
+  event_id?: string;
+  summary: string;
+  description: string;
+  location: string;
+  start_ms: number;
+  end_ms: number;
+  all_day: boolean;
+  attendees: string; // comma separated
+};
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+function localDateValue(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function localTimeValue(ms: number): string {
+  const d = new Date(ms);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+function parseLocalDate(s: string): number {
+  const t = new Date(`${s}T00:00:00`).getTime();
+  return Number.isFinite(t) ? t : Date.now();
+}
+
+function combineDateTime(dateStr: string, timeStr: string): number {
+  const t = new Date(`${dateStr}T${timeStr}`).getTime();
+  return Number.isFinite(t) ? t : Date.now();
+}
+
+function bumpMinutes(ms: number, minutes: number): number {
+  return ms + minutes * 60_000;
+}
+
+function EventEditorModal(props: {
+  draft: EventDraft;
+  accounts: Account[];
+  calendars: CalendarRow[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  useEscClose(() => true, () => props.onClose());
+  const [summary, setSummary] = createSignal(props.draft.summary);
+  const [description, setDescription] = createSignal(props.draft.description);
+  const [location, setLocation] = createSignal(props.draft.location);
+  const [allDay, setAllDay] = createSignal(props.draft.all_day);
+  const [startMs, setStartMs] = createSignal(props.draft.start_ms);
+  const [endMs, setEndMs] = createSignal(props.draft.end_ms);
+  const [attendees, setAttendees] = createSignal(props.draft.attendees);
+  const isEdit = !!props.draft.event_id;
+
+  // Initial account/calendar selection — derive from draft or default to the
+  // first account's primary calendar.
+  const defaultAccount = () =>
+    props.draft.account_email ?? props.accounts[0]?.email ?? "";
+  const defaultCalendar = () => {
+    const cals = props.calendars.filter(
+      (c) => c.account_email === accountEmail(),
+    );
+    if (props.draft.calendar_id) return props.draft.calendar_id;
+    const primary = cals.find((c) => c.is_primary);
+    return primary?.id ?? cals[0]?.id ?? "primary";
+  };
+  const [accountEmail, setAccountEmail] = createSignal(defaultAccount());
+  const [calendarId, setCalendarId] = createSignal(props.draft.calendar_id ?? "");
+  // Reset calendar selection when account changes.
+  createEffect(() => {
+    const cals = props.calendars.filter(
+      (c) => c.account_email === accountEmail(),
+    );
+    if (!cals.some((c) => c.id === calendarId())) {
+      const primary = cals.find((c) => c.is_primary);
+      setCalendarId(primary?.id ?? cals[0]?.id ?? "");
+    }
+  });
+  // Initialize on mount
+  if (!calendarId()) setCalendarId(defaultCalendar());
+
+  const [saving, setSaving] = createSignal(false);
+  const [err, setErr] = createSignal<string | null>(null);
+
+  async function save() {
+    if (!summary().trim()) {
+      setErr("Title is required");
+      return;
+    }
+    if (!accountEmail() || !calendarId()) {
+      setErr("Pick an account and calendar");
+      return;
+    }
+    if (endMs() <= startMs()) {
+      setErr("End must be after start");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    const attendeeList = attendees()
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    const payload = {
+      email: accountEmail(),
+      calendarId: calendarId(),
+      summary: summary(),
+      description: description() || null,
+      location: location() || null,
+      startMs: startMs(),
+      endMs: endMs(),
+      allDay: allDay(),
+      attendees: attendeeList,
+    };
+    try {
+      if (isEdit) {
+        await invoke("update_event", {
+          request: { ...payload, eventId: props.draft.event_id },
+        });
+        showToast({ message: "Event updated" });
+      } else {
+        await invoke("create_event", { request: payload });
+        showToast({ message: "Event created" });
+      }
+      props.onSaved();
+      props.onClose();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      class="fixed inset-0 z-[65] flex items-center justify-center bg-black/50 p-4"
+      onClick={props.onClose}
+    >
+      <div
+        class="flex max-h-[85vh] w-full max-w-xl flex-col rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        <header class="flex items-center justify-between border-b border-[color:var(--color-border)] px-5 py-3">
+          <h2 class="text-base font-semibold">
+            {isEdit ? "Edit event" : "New event"}
+          </h2>
+          <button
+            type="button"
+            onClick={props.onClose}
+            class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </header>
+        <div class="flex-1 space-y-3 overflow-y-auto px-5 py-4 text-sm">
+          <Field label="Title">
+            <input
+              value={summary()}
+              onInput={(e) => setSummary(e.currentTarget.value)}
+              placeholder="Event title"
+              class="w-full rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none focus:border-[color:var(--color-accent)]"
+              autofocus
+            />
+          </Field>
+          <label class="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={allDay()}
+              onChange={(e) => setAllDay(e.currentTarget.checked)}
+              class="accent-[color:var(--color-accent)]"
+            />
+            All day
+          </label>
+          <DateTimeRow
+            label="Start"
+            ms={startMs()}
+            allDay={allDay()}
+            onChange={(ms) => {
+              const oldDuration = endMs() - startMs();
+              setStartMs(ms);
+              // Keep the duration constant when moving the start so the user
+              // doesn't have to re-set end every time.
+              setEndMs(ms + Math.max(15 * 60_000, oldDuration));
+            }}
+          />
+          <DateTimeRow
+            label="End"
+            ms={endMs()}
+            allDay={allDay()}
+            onChange={setEndMs}
+          />
+          <Field label="Location">
+            <input
+              value={location()}
+              onInput={(e) => setLocation(e.currentTarget.value)}
+              class="w-full rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none focus:border-[color:var(--color-accent)]"
+            />
+          </Field>
+          <Field label="Description">
+            <textarea
+              value={description()}
+              onInput={(e) => setDescription(e.currentTarget.value)}
+              rows={3}
+              class="w-full resize-none rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none focus:border-[color:var(--color-accent)]"
+            />
+          </Field>
+          <Field label="Attendees">
+            <input
+              value={attendees()}
+              onInput={(e) => setAttendees(e.currentTarget.value)}
+              placeholder="alice@example.com, bob@example.com"
+              class="w-full rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none focus:border-[color:var(--color-accent)]"
+            />
+          </Field>
+          <div class="grid grid-cols-2 gap-3">
+            <Field label="Account">
+              <select
+                disabled={isEdit}
+                value={accountEmail()}
+                onChange={(e) => setAccountEmail(e.currentTarget.value)}
+                class="w-full rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none disabled:opacity-50"
+              >
+                <For each={props.accounts}>
+                  {(a) => <option value={a.email}>{a.email}</option>}
+                </For>
+              </select>
+            </Field>
+            <Field label="Calendar">
+              <select
+                disabled={isEdit}
+                value={calendarId()}
+                onChange={(e) => setCalendarId(e.currentTarget.value)}
+                class="w-full rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none disabled:opacity-50"
+              >
+                <For
+                  each={props.calendars.filter(
+                    (c) => c.account_email === accountEmail(),
+                  )}
+                >
+                  {(c) => <option value={c.id}>{c.summary}</option>}
+                </For>
+              </select>
+            </Field>
+          </div>
+          <Show when={err()}>
+            <div class="rounded border border-red-400 bg-red-50 px-2 py-1 text-xs text-red-700 dark:bg-red-950 dark:text-red-200">
+              {err()}
+            </div>
+          </Show>
+        </div>
+        <footer class="flex justify-end gap-2 border-t border-[color:var(--color-border)] px-5 py-3">
+          <button
+            type="button"
+            onClick={props.onClose}
+            class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={saving()}
+            onClick={save}
+            class="rounded bg-[color:var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
+          >
+            {saving() ? "Saving…" : isEdit ? "Save" : "Create"}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function Field(props: { label: string; children: any }) {
+  return (
+    <label class="block">
+      <span class="mb-0.5 block text-xs font-medium text-[color:var(--color-muted)]">
+        {props.label}
+      </span>
+      {props.children}
+    </label>
+  );
+}
+
+function DateTimeRow(props: {
+  label: string;
+  ms: number;
+  allDay: boolean;
+  onChange: (ms: number) => void;
+}) {
+  const inputCls =
+    "rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 outline-none focus:border-[color:var(--color-accent)]";
+  return (
+    <div>
+      <div class="mb-0.5 text-xs font-medium text-[color:var(--color-muted)]">
+        {props.label}
+      </div>
+      <div class="flex items-center gap-1.5">
+        <input
+          type="date"
+          value={localDateValue(props.ms)}
+          onChange={(e) => {
+            const t = props.allDay
+              ? parseLocalDate(e.currentTarget.value)
+              : combineDateTime(
+                  e.currentTarget.value,
+                  localTimeValue(props.ms),
+                );
+            props.onChange(t);
+          }}
+          class={`${inputCls} flex-1`}
+        />
+        <Show when={!props.allDay}>
+          <input
+            type="time"
+            step="900"
+            value={localTimeValue(props.ms)}
+            onChange={(e) =>
+              props.onChange(
+                combineDateTime(
+                  localDateValue(props.ms),
+                  e.currentTarget.value,
+                ),
+              )
+            }
+            class={`${inputCls} w-24 tabular-nums`}
+          />
+          <button
+            type="button"
+            title="−15 min"
+            onClick={() => props.onChange(bumpMinutes(props.ms, -15))}
+            class="rounded border border-[color:var(--color-border)] px-2 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
+          >
+            −15
+          </button>
+          <button
+            type="button"
+            title="+15 min"
+            onClick={() => props.onChange(bumpMinutes(props.ms, 15))}
+            class="rounded border border-[color:var(--color-border)] px-2 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
+          >
+            +15
+          </button>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
 function CalendarPicker(props: {
   accounts: Account[];
   calendars: CalendarRow[];
@@ -1101,6 +1628,7 @@ function CalendarPicker(props: {
   onClose: () => void;
   eventStyle: (ev: EventRow) => EventStyle;
 }) {
+  useEscClose(() => true, () => props.onClose());
   const grouped = createMemo(() => {
     const byEmail = new Map<string, CalendarRow[]>();
     for (const c of props.calendars) {
@@ -1184,7 +1712,10 @@ function EventDetailModal(props: {
   eventStyle: EventStyle;
   onClose: () => void;
   onChanged: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
 }) {
+  useEscClose(() => true, () => props.onClose());
   const e = props.event;
   const dt = (ms: number, all_day: boolean) => {
     const d = new Date(ms);
@@ -1382,6 +1913,20 @@ function EventDetailModal(props: {
               Decline
             </button>
           </Show>
+          <button
+            type="button"
+            onClick={props.onEdit}
+            class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]"
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            onClick={props.onDelete}
+            class="rounded border border-red-400 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
+          >
+            Delete
+          </button>
           <Show when={e.html_link}>
             {(href) => (
               <button
