@@ -29,11 +29,12 @@ function isLocalImageSrc(src: string): boolean {
 
 // Resolve a single `cid:` reference using the supplied map. Returns the
 // resolved data: URL if found, else null (caller decides whether to drop the
-// img or leave the cid as-is).
+// img or leave the cid as-is). The lookup is case-insensitive because mail
+// producers freely mix case between body refs and Content-Id headers.
 function resolveCid(src: string, map: Record<string, string>): string | null {
   const trimmed = src.trim();
   if (!trimmed.toLowerCase().startsWith("cid:")) return null;
-  const id = trimmed.slice(4).trim();
+  const id = trimmed.slice(4).trim().toLowerCase();
   return map[id] ?? null;
 }
 
@@ -112,6 +113,22 @@ export function sanitizeMessageHtml(
       );
       if (next !== style) {
         el.setAttribute("style", next);
+        blocked += 1;
+      }
+    });
+
+    // <style> element bodies were a known leak: @import and url(http…) load
+    // remote resources during render with no user gesture, leaking the fact
+    // that the user opened the message. Strip those rules but keep the
+    // surrounding stylesheet so legitimate inline layout still works.
+    doc.querySelectorAll("style").forEach((el) => {
+      const css = el.textContent ?? "";
+      if (!css) return;
+      const next = css
+        .replace(/@import[^;}]*[;}]/gi, "")
+        .replace(/url\(\s*(['"]?)(https?:|\/\/)[^)]*\)/gi, "none");
+      if (next !== css) {
+        el.textContent = next;
         blocked += 1;
       }
     });

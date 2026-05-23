@@ -510,7 +510,17 @@ fn collect_attachments(part: &MessagePart, out: &mut Vec<Attachment>) {
         let content_id = headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case("Content-Id"))
-            .map(|h| h.value.trim().trim_matches('<').trim_matches('>').to_string());
+            .map(|h| {
+                // Normalise to lowercase so frontend lookup is case-insensitive.
+                // Mail bodies routinely reference `cid:LOGO` while the part
+                // header says `<logo>` (or vice-versa); without this the
+                // resolver returned undefined and the image rendered broken.
+                h.value
+                    .trim()
+                    .trim_matches('<')
+                    .trim_matches('>')
+                    .to_ascii_lowercase()
+            });
         let disposition = headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case("Content-Disposition"))

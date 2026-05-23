@@ -44,6 +44,16 @@ describe("sanitizeMessageHtml", () => {
     expect(html).not.toContain("cid:logo");
   });
 
+  it("resolves cid: case-insensitively", () => {
+    const dataUrl = "data:image/png;base64,BBBB";
+    const { html } = sanitizeMessageHtml('<img src="cid:LOGO">', {
+      allowRemoteImages: false,
+      dark: false,
+      cidMap: { logo: dataUrl },
+    });
+    expect(html).toContain(`src="${dataUrl}"`);
+  });
+
   it("removes <base> and <link> tags so remote refs cannot leak", () => {
     const { html } = sanitizeMessageHtml(
       '<base href="https://evil/"><link rel="stylesheet" href="https://evil/x.css"><p>ok</p>',
@@ -119,6 +129,27 @@ describe("sanitizeMessageHtml", () => {
     );
     expect(blockedImages).toBeGreaterThan(0);
     expect(html).not.toMatch(/url\(\s*https:\/\//);
+  });
+
+  it("strips @import and remote url() from <style> bodies when blocking", () => {
+    const { html, blockedImages } = sanitizeMessageHtml(
+      '<style>@import url("https://t/x.css");body{background:url(https://t/y.png)}</style><p>ok</p>',
+      { allowRemoteImages: false, dark: false },
+    );
+    expect(blockedImages).toBeGreaterThan(0);
+    expect(html).not.toMatch(/@import/i);
+    expect(html).not.toMatch(/url\(\s*['"]?https:\/\//);
+    // <style> tag itself stays so other rules in the sheet keep working.
+    expect(html).toContain("<style>");
+    expect(html).toContain("<p>ok</p>");
+  });
+
+  it("keeps remote url() in <style> when images are allowed", () => {
+    const { html } = sanitizeMessageHtml(
+      '<style>body{background:url(https://t/y.png)}</style>',
+      { allowRemoteImages: true, dark: false },
+    );
+    expect(html).toContain("url(https://t/y.png)");
   });
 
   it("injects dark-mode style preamble when dark=true", () => {

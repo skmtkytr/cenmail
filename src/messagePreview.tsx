@@ -94,7 +94,13 @@ function ThreadMessage(props: {
           messageId: props.detail.id,
           attachmentId: a.attachment_id,
         }).then(
-          (b64) => [a.content_id!, `data:${a.mime_type};base64,${b64}`] as const,
+          (b64) =>
+            [
+              // Normalise to lowercase so the sanitizer's case-insensitive
+              // lookup hits regardless of how the producer cased Content-Id.
+              a.content_id!.toLowerCase(),
+              `data:${a.mime_type};base64,${b64}`,
+            ] as const,
           () => null,
         ),
       ),
