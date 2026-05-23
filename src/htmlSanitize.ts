@@ -137,8 +137,39 @@ export function sanitizeMessageHtml(
     doc.head.appendChild(style);
   }
 
+  // Click intercept: the iframe runs in an opaque-origin sandbox (no
+  // allow-same-origin), so it can't reach the host. It can still
+  // postMessage, which the App listens for and routes through the Tauri
+  // opener plugin. Without this links would silently no-op because
+  // target="_blank" inside a sandboxed iframe isn't honored by the
+  // platform webview.
+  const intercept = doc.createElement("script");
+  intercept.textContent = LINK_INTERCEPT_SCRIPT;
+  doc.body.appendChild(intercept);
+
   return {
     html: `<!doctype html>${doc.documentElement.outerHTML}`,
     blockedImages: blocked,
   };
 }
+
+const LINK_INTERCEPT_SCRIPT = `
+(function () {
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    while (t && t.nodeType === 1 && t.tagName !== 'A') t = t.parentNode;
+    if (!t || t.tagName !== 'A') return;
+    var href = t.getAttribute('href');
+    if (!href) return;
+    var lower = href.toLowerCase();
+    if (lower.indexOf('javascript:') === 0 || lower.indexOf('vbscript:') === 0) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    try {
+      parent.postMessage({ type: 'cenmail:open', href: t.href || href }, '*');
+    } catch (err) {}
+  }, true);
+})();
+`;

@@ -10,6 +10,7 @@ import {
 import { createStore } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   isPermissionGranted,
   requestPermission,
@@ -1858,9 +1859,29 @@ function App() {
     const onDocClick = () => closeContextMenu();
     document.addEventListener("click", onDocClick);
     document.addEventListener("keydown", handleShortcut);
+    // Sanitized message iframes can't reach the host (opaque origin) so
+    // they postMessage link clicks here. We validate the scheme before
+    // handing the URL to the OS opener — only http(s) and mailto: pass.
+    const onIframeMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: string; href?: string } | null;
+      if (!data || data.type !== "cenmail:open") return;
+      const href = data.href;
+      if (typeof href !== "string" || href.length === 0) return;
+      try {
+        const u = new URL(href);
+        if (!["http:", "https:", "mailto:"].includes(u.protocol)) return;
+      } catch {
+        return;
+      }
+      void openUrl(href).catch((err) =>
+        showToast({ message: `Open failed: ${err}`, variant: "error" }),
+      );
+    };
+    window.addEventListener("message", onIframeMessage);
     onCleanup(() => {
       document.removeEventListener("click", onDocClick);
       document.removeEventListener("keydown", handleShortcut);
+      window.removeEventListener("message", onIframeMessage);
     });
   });
 

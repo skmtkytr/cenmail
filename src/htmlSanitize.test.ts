@@ -85,7 +85,11 @@ describe("sanitizeMessageHtml", () => {
       '<a href="javascript:alert(1)">x</a>',
       { allowRemoteImages: true, dark: false },
     );
-    expect(html).not.toMatch(/javascript:/i);
+    // The <a> itself loses href (so a click does nothing). The literal
+    // "javascript:" appears in the intercept script body, which is why
+    // we look at the <a> tag specifically.
+    expect(html).not.toMatch(/<a[^>]*\bhref=/i);
+    expect(html).not.toMatch(/alert\(1\)/);
   });
 
   it("strips inline event handlers", () => {
@@ -96,13 +100,16 @@ describe("sanitizeMessageHtml", () => {
     expect(html).not.toMatch(/onclick/i);
   });
 
-  it("removes <script> elements", () => {
+  it("strips user-supplied scripts but keeps the link-intercept", () => {
     const { html } = sanitizeMessageHtml(
       '<p>ok</p><script>alert(1)</script>',
       { allowRemoteImages: true, dark: false },
     );
-    expect(html).not.toMatch(/<script/i);
+    // Payload is gone…
+    expect(html).not.toMatch(/alert\(1\)/);
     expect(html).toContain("<p>ok</p>");
+    // …but our own intercept (postMessage to parent) is appended.
+    expect(html).toContain("cenmail:open");
   });
 
   it("removes background-image url() from inline styles when blocking", () => {

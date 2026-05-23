@@ -226,7 +226,7 @@ function ThreadMessage(props: {
             </Show>
             <iframe
               srcdoc={sanitized().html}
-              sandbox="allow-popups allow-popups-to-escape-sandbox"
+              sandbox="allow-scripts allow-popups-to-escape-sandbox"
               class={`w-full border-0 ${
                 fillsRemaining() ? "min-h-0 flex-1" : "h-[60vh]"
               } ${
