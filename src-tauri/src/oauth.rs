@@ -24,13 +24,32 @@ const SCOPES: &[&str] = &[
 pub struct OAuthResult {
     pub email: String,
     pub display_name: Option<String>,
+    pub picture_url: Option<String>,
     pub refresh_token: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct UserInfo {
-    email: String,
-    name: Option<String>,
+pub struct UserInfo {
+    pub email: String,
+    pub name: Option<String>,
+    pub picture: Option<String>,
+}
+
+pub async fn fetch_userinfo(
+    http: &reqwest::Client,
+    access_token: &str,
+) -> anyhow::Result<UserInfo> {
+    Ok(http
+        .get(USERINFO_URL)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("fetch userinfo")?
+        .error_for_status()
+        .context("userinfo status")?
+        .json()
+        .await
+        .context("parse userinfo")?)
 }
 
 pub async fn run_flow(config: &OAuthConfig, app: &AppHandle) -> Result<OAuthResult> {
@@ -94,21 +113,12 @@ pub async fn run_flow(config: &OAuthConfig, app: &AppHandle) -> Result<OAuthResu
             )
         })?;
 
-    let userinfo: UserInfo = http_client
-        .get(USERINFO_URL)
-        .bearer_auth(&access_token)
-        .send()
-        .await
-        .context("fetch userinfo")?
-        .error_for_status()
-        .context("userinfo status")?
-        .json()
-        .await
-        .context("parse userinfo")?;
+    let userinfo = fetch_userinfo(&http_client, &access_token).await?;
 
     Ok(OAuthResult {
         email: userinfo.email,
         display_name: userinfo.name,
+        picture_url: userinfo.picture,
         refresh_token,
     })
 }
@@ -167,4 +177,37 @@ fn parse_callback(url_path: &str) -> Result<(String, String)> {
         code.context("no code in callback")?,
         state.context("no state in callback")?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_callback_extracts_code_and_state() {
+        let (code, state) =
+            parse_callback("/callback?code=abc123&state=xyz").expect("parse ok");
+        assert_eq!(code, "abc123");
+        assert_eq!(state, "xyz");
+    }
+
+    #[test]
+    fn parse_callback_url_decodes_values() {
+        let (code, _) =
+            parse_callback("/callback?code=ab%2Fcd&state=s").expect("parse ok");
+        assert_eq!(code, "ab/cd");
+    }
+
+    #[test]
+    fn parse_callback_propagates_provider_error() {
+        let err = parse_callback("/callback?error=access_denied&state=x")
+            .expect_err("should fail");
+        assert!(err.to_string().contains("access_denied"));
+    }
+
+    #[test]
+    fn parse_callback_requires_code_and_state() {
+        assert!(parse_callback("/callback?code=a").is_err());
+        assert!(parse_callback("/callback?state=s").is_err());
+    }
 }

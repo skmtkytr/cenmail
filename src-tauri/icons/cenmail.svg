@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded-square background -->
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- three account dots above the envelope (centralized → unified) -->
+  <circle cx="356" cy="296" r="40" fill="#fbbf24"/>
+  <circle cx="512" cy="240" r="40" fill="#f472b6"/>
+  <circle cx="668" cy="296" r="40" fill="#34d399"/>
+
+  <!-- subtle convergence lines from dots into the envelope flap -->
+  <g stroke="rgba(255,255,255,0.45)" stroke-width="6" stroke-linecap="round" fill="none">
+    <line x1="376" y1="332" x2="464" y2="500"/>
+    <line x1="512" y1="280" x2="512" y2="500"/>
+    <line x1="648" y1="332" x2="560" y2="500"/>
+  </g>
+
+  <!-- envelope body -->
+  <g transform="translate(224, 496)">
+    <rect x="0" y="0" width="576" height="360" rx="40" fill="white"/>
+    <!-- flap V -->
+    <path d="M 32 48 L 288 264 L 544 48"
+          fill="none"
+          stroke="#1e3a8a"
+          stroke-width="36"
+          stroke-linejoin="round"
+          stroke-linecap="round"/>
+  </g>
+</svg>

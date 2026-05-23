@@ -17,8 +17,11 @@ Requires: Rust toolchain, Node 20+, pnpm, `webkit2gtk-4.1` (Linux).
 
 ```fish
 pnpm install
-pnpm app   # WEBKIT_DISABLE_DMABUF_RENDERER=1 tauri dev
+pnpm app   # = op run --env-file=.env.op -- env WEBKIT_DISABLE_DMABUF_RENDERER=1 tauri dev
 ```
+
+`pnpm app` は `op run` を内蔵しているので、Google OAuth の Client ID/Secret は
+1Password から自動注入されます (要 op CLI auth)。`.env.op` のテンプレは `.env.op.example` 参照。
 
 > NVIDIA + Wayland 環境では WebKit2GTK の DMABuf レンダラーが Wayland とぶつかるため
 > `WEBKIT_DISABLE_DMABUF_RENDERER=1` を付けないと Gdk Error 71 で起動しません。
