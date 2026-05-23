@@ -20,6 +20,8 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Gmail-only for 
 - Desktop notifications for new Personal-bucket mail
 - Full-text search (Gmail `q` syntax passed through)
 - Keyboard-driven UI
+- **Calendar pane** — week view, event details, accept / decline / tentative
+- Inline RSVP buttons when an email contains a meeting invite (text/calendar)
 
 ### Keyboard shortcuts
 
@@ -37,6 +39,7 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Gmail-only for 
 | `c` | Compose new |
 | `/` | Search |
 | `Ctrl`+`Shift`+`R` | Sync now |
+| `Ctrl`+`Shift`+`1` / `2` | Switch to Mail / Calendar |
 | `?` | Show shortcut help |
 | `Esc` | Close modal / deselect |
 

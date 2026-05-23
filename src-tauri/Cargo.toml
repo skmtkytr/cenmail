@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Centralized mail — a Spark-inspired desktop mail client for Linux"
 authors = ["Kyotaro Sakamoto <skmtkytr@gmail.com>"]
 edition = "2021"
+default-run = "cenmail"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

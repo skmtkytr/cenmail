@@ -74,6 +74,14 @@ pub struct MessageDetail {
     pub references: String,
     pub html_body: Option<String>,
     pub text_body: Option<String>,
+    #[serde(default)]
+    pub calendar_body: Option<String>,
+    /// METHOD: line value from the ICS, if any (REQUEST / REPLY / CANCEL).
+    #[serde(default)]
+    pub calendar_method: Option<String>,
+    /// UID: line value — useful to match against Google Calendar event ids.
+    #[serde(default)]
+    pub calendar_uid: Option<String>,
 }
 
 pub async fn list_message_ids(
@@ -241,6 +249,11 @@ pub async fn fetch_full(
 
     let html_body = payload.as_ref().and_then(|p| find_part(p, "text/html"));
     let text_body = payload.as_ref().and_then(|p| find_part(p, "text/plain"));
+    let calendar_body = payload.as_ref().and_then(|p| find_part(p, "text/calendar"));
+    let (calendar_method, calendar_uid) = match &calendar_body {
+        Some(ics) => (extract_ics_line(ics, "METHOD"), extract_ics_line(ics, "UID")),
+        None => (None, None),
+    };
 
     Ok(MessageDetail {
         id: raw.id,
@@ -254,7 +267,28 @@ pub async fn fetch_full(
         references: header("References"),
         html_body,
         text_body,
+        calendar_body,
+        calendar_method,
+        calendar_uid,
     })
+}
+
+fn extract_ics_line(ics: &str, name: &str) -> Option<String> {
+    let prefix_colon = format!("{name}:");
+    let prefix_semi = format!("{name};");
+    for raw_line in ics.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with(&prefix_colon) {
+            return Some(line[prefix_colon.len()..].trim().to_string());
+        }
+        if line.starts_with(&prefix_semi) {
+            // Skip params, just grab whatever's after the value separator.
+            if let Some(idx) = line.find(':') {
+                return Some(line[idx + 1..].trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn raw_to_meta(raw: RawMessage, account_email: &str) -> MessageMeta {

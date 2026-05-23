@@ -23,6 +23,11 @@ export type Settings = {
   privacy: {
     alwaysAllowImages: boolean;
   };
+  calendar: {
+    // Key: `${account_email}|${calendar_id}`. Missing key falls back to the
+    // calendar's `selected` flag from Google.
+    visibility: Record<string, boolean>;
+  };
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -44,6 +49,9 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   privacy: {
     alwaysAllowImages: false,
+  },
+  calendar: {
+    visibility: {},
   },
 };
 
@@ -70,6 +78,14 @@ function mergeDefaults(partial: unknown): Settings {
     compose: { ...DEFAULT_SETTINGS.compose, ...(p.compose ?? {}) },
     inbox: { ...DEFAULT_SETTINGS.inbox, ...(p.inbox ?? {}) },
     privacy: { ...DEFAULT_SETTINGS.privacy, ...(p.privacy ?? {}) },
+    calendar: {
+      ...DEFAULT_SETTINGS.calendar,
+      ...(p.calendar ?? {}),
+      visibility: {
+        ...DEFAULT_SETTINGS.calendar.visibility,
+        ...(p.calendar?.visibility ?? {}),
+      },
+    },
   };
 }
 

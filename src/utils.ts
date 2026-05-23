@@ -95,6 +95,8 @@ export function matchesFolder(labels: string[], folder: string): boolean {
       return has("SENT");
     case "trash":
       return has("TRASH");
+    case "spam":
+      return has("SPAM");
     case "snoozed":
       // Snoozed-ness lives in a separate SQLite table, not in Gmail labels.
       // Treat label-only mutations as in-place so the cache stays consistent;

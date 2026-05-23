@@ -72,6 +72,43 @@ fn init_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (account_email, thread_id)
         );
 
+        CREATE TABLE IF NOT EXISTS calendars (
+            account_email     TEXT NOT NULL,
+            id                TEXT NOT NULL,
+            summary           TEXT NOT NULL DEFAULT '',
+            description       TEXT,
+            time_zone         TEXT,
+            background_color  TEXT,
+            foreground_color  TEXT,
+            is_primary        INTEGER NOT NULL DEFAULT 0,
+            selected          INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (account_email, id)
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            account_email   TEXT NOT NULL,
+            calendar_id     TEXT NOT NULL,
+            id              TEXT NOT NULL,
+            ical_uid        TEXT,
+            summary         TEXT NOT NULL DEFAULT '',
+            description     TEXT,
+            location        TEXT,
+            organizer_email TEXT,
+            organizer_name  TEXT,
+            start_ms        INTEGER NOT NULL,
+            end_ms          INTEGER NOT NULL,
+            all_day         INTEGER NOT NULL DEFAULT 0,
+            attendees_json  TEXT NOT NULL DEFAULT '[]',
+            response_status TEXT,
+            html_link       TEXT,
+            conference_uri  TEXT,
+            status          TEXT,
+            fetched_at      TEXT NOT NULL,
+            PRIMARY KEY (account_email, calendar_id, id)
+        );
+        CREATE INDEX IF NOT EXISTS events_start
+          ON events (account_email, start_ms);
+
         CREATE TABLE IF NOT EXISTS scheduled_sends (
             id            TEXT PRIMARY KEY,
             account_email TEXT NOT NULL,
@@ -96,8 +133,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    // Best-effort migration: existing accounts table created before
-    // `picture_url` was added. ADD COLUMN errors out if it already exists.
+    // Best-effort column migrations BEFORE any index referencing the new
+    // columns. ADD COLUMN errors out if the column already exists, which we
+    // swallow.
     let _ = conn.execute("ALTER TABLE accounts ADD COLUMN picture_url TEXT", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN ical_uid TEXT", []);
+
+    // Indexes on the new columns — safe to run after the migration succeeded
+    // (or noop'd because the column already existed).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS events_ical_uid
+           ON events (account_email, ical_uid);",
+    )?;
     Ok(())
 }

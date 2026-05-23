@@ -10,6 +10,7 @@ use cenmail_lib::{
     commands::AppState,
     config::OAuthConfig,
     db,
+    gcal,
     gmail::{self, auth::TokenCache, messages::MessageMeta},
 };
 use chrono::{DateTime, Utc};
@@ -164,6 +165,60 @@ enum Cmd {
     Send(SendArgs),
     /// Schedule a send for later (--at).
     Schedule(ScheduleArgs),
+    /// Calendar operations.
+    Calendar {
+        #[command(subcommand)]
+        sub: CalCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalCmd {
+    /// List configured calendars for an account.
+    List {
+        #[arg(long)]
+        email: String,
+        /// Refetch from Google before listing.
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sync events from Google into the local cache for a window.
+    Sync {
+        #[arg(long)]
+        email: String,
+        /// Calendar id ("primary" is allowed).
+        #[arg(long, default_value = "primary")]
+        calendar: String,
+        /// Start of window. Humantime ("now", "1h") or RFC3339.
+        #[arg(long, default_value = "now")]
+        from: String,
+        /// End of window.
+        #[arg(long, default_value = "30d")]
+        to: String,
+    },
+    /// List cached events in a window.
+    Events {
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long, default_value = "now")]
+        from: String,
+        #[arg(long, default_value = "7d")]
+        to: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Respond to an event (accepted / declined / tentative / needsAction).
+    Rsvp {
+        event_id: String,
+        #[arg(long)]
+        email: String,
+        #[arg(long, default_value = "primary")]
+        calendar: String,
+        #[arg(long)]
+        status: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -255,6 +310,29 @@ async fn main() -> Result<()> {
         Cmd::Unstar { message_id, email } => modify_labels_cmd(&state, &email, &message_id, &[], &["STARRED"]).await,
         Cmd::Send(args) => cmd_send(&state, args).await,
         Cmd::Schedule(args) => cmd_schedule(&state, args).await,
+        Cmd::Calendar { sub } => match sub {
+            CalCmd::List { email, refresh, json } => {
+                cmd_cal_list(&state, &email, refresh, json).await
+            }
+            CalCmd::Sync {
+                email,
+                calendar,
+                from,
+                to,
+            } => cmd_cal_sync(&state, &email, &calendar, &from, &to).await,
+            CalCmd::Events {
+                email,
+                from,
+                to,
+                json,
+            } => cmd_cal_events(&state, email.as_deref(), &from, &to, json),
+            CalCmd::Rsvp {
+                event_id,
+                email,
+                calendar,
+                status,
+            } => cmd_cal_rsvp(&state, &email, &calendar, &event_id, &status).await,
+        },
     }
 }
 
@@ -420,6 +498,7 @@ fn cmd_list(
         "pinned" => " AND label_ids LIKE '%\"STARRED\"%'",
         "sent" => " AND label_ids LIKE '%\"SENT\"%'",
         "trash" => " AND label_ids LIKE '%\"TRASH\"%'",
+        "spam" => " AND label_ids LIKE '%\"SPAM\"%'",
         "snoozed" => " AND EXISTS (
             SELECT 1 FROM snoozes s
             WHERE s.account_email = messages.account_email AND s.message_id = messages.id
@@ -971,6 +1050,299 @@ async fn cmd_send(state: &AppState, args: SendArgs) -> Result<()> {
     .await?;
     let id = gmail::compose::send(&state.http, &token, &compose).await?;
     println!("{id}");
+    Ok(())
+}
+
+// ----- Calendar commands -----
+
+fn parse_when_or_now(s: &str) -> Result<i64> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("now") {
+        return Ok(Utc::now().timestamp_millis());
+    }
+    parse_when(trimmed)
+}
+
+async fn cmd_cal_list(
+    state: &AppState,
+    email: &str,
+    refresh: bool,
+    json: bool,
+) -> Result<()> {
+    if refresh {
+        let token = gmail::auth::access_token(
+            &state.token_cache,
+            &state.oauth_config,
+            &state.http,
+            email,
+        )
+        .await?;
+        let cals = gcal::calendars::list_calendars(&state.http, &token).await?;
+        let conn = state.db.lock().map_err(|e| anyhow!("db lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        for c in &cals {
+            tx.execute(
+                "INSERT OR REPLACE INTO calendars
+                 (account_email, id, summary, description, time_zone,
+                  background_color, foreground_color, is_primary, selected)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    email,
+                    c.id,
+                    c.summary,
+                    c.description,
+                    c.time_zone,
+                    c.background_color,
+                    c.foreground_color,
+                    c.primary.unwrap_or(false) as i64,
+                    c.selected.unwrap_or(true) as i64,
+                ],
+            )?;
+        }
+        tx.commit()?;
+    }
+    let conn = state.db.lock().map_err(|e| anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, summary, is_primary, background_color
+         FROM calendars WHERE account_email = ?1
+         ORDER BY is_primary DESC, summary ASC",
+    )?;
+    #[derive(Serialize)]
+    struct CalRow {
+        id: String,
+        summary: String,
+        primary: bool,
+        background_color: Option<String>,
+    }
+    let rows: Vec<CalRow> = stmt
+        .query_map(params![email], |r| {
+            Ok(CalRow {
+                id: r.get(0)?,
+                summary: r.get(1)?,
+                primary: r.get::<_, i64>(2)? != 0,
+                background_color: r.get(3)?,
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    if json {
+        return print_json(&rows);
+    }
+    for c in rows {
+        let marker = if c.primary { "*" } else { " " };
+        println!("{marker} {:35.35}  {}", c.summary, c.id);
+    }
+    Ok(())
+}
+
+async fn cmd_cal_sync(
+    state: &AppState,
+    email: &str,
+    calendar_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let from_ms = parse_when_or_now(from)?;
+    let to_ms = parse_when_or_now(to)?;
+    let from_dt = DateTime::<Utc>::from_timestamp_millis(from_ms)
+        .ok_or_else(|| anyhow!("invalid from"))?;
+    let to_dt = DateTime::<Utc>::from_timestamp_millis(to_ms)
+        .ok_or_else(|| anyhow!("invalid to"))?;
+    let token = gmail::auth::access_token(
+        &state.token_cache,
+        &state.oauth_config,
+        &state.http,
+        email,
+    )
+    .await?;
+    let evs =
+        gcal::events::list_events(&state.http, &token, calendar_id, from_dt, to_dt).await?;
+    let count = evs.len();
+    let conn = state.db.lock().map_err(|e| anyhow!("db lock: {e}"))?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM events
+         WHERE account_email = ?1 AND calendar_id = ?2
+           AND start_ms >= ?3 AND start_ms < ?4",
+        params![email, calendar_id, from_ms, to_ms],
+    )?;
+    for ev in &evs {
+        let (start_ms, end_ms, all_day) = match gcal::events::event_time_range(ev) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let attendees_json =
+            serde_json::to_string(&ev.attendees).unwrap_or_else(|_| "[]".into());
+        let (org_email, org_name) = match &ev.organizer {
+            Some(o) => (o.email.clone(), o.display_name.clone()),
+            None => (None, None),
+        };
+        let self_status = ev
+            .attendees
+            .iter()
+            .find(|a| a.self_field == Some(true))
+            .and_then(|a| a.response_status.clone());
+        let conf_uri = ev.conference_data.as_ref().and_then(|c| {
+            c.entry_points
+                .iter()
+                .find(|p| p.entry_point_type.as_deref() == Some("video"))
+                .and_then(|p| p.uri.clone())
+        });
+        tx.execute(
+            "INSERT OR REPLACE INTO events
+             (account_email, calendar_id, id, summary, description, location,
+              organizer_email, organizer_name, start_ms, end_ms, all_day,
+              attendees_json, response_status, html_link, conference_uri,
+              status, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                email,
+                calendar_id,
+                ev.id,
+                ev.summary.clone().unwrap_or_default(),
+                ev.description,
+                ev.location,
+                org_email,
+                org_name,
+                start_ms,
+                end_ms,
+                all_day as i64,
+                attendees_json,
+                self_status,
+                ev.html_link,
+                conf_uri,
+                ev.status,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+    }
+    tx.commit()?;
+    println!("{count} events synced");
+    Ok(())
+}
+
+fn cmd_cal_events(
+    state: &AppState,
+    email: Option<&str>,
+    from: &str,
+    to: &str,
+    json: bool,
+) -> Result<()> {
+    let from_ms = parse_when_or_now(from)?;
+    let to_ms = parse_when_or_now(to)?;
+    let conn = state.db.lock().map_err(|e| anyhow!("db lock: {e}"))?;
+    let sql = match email {
+        Some(_) => "SELECT account_email, calendar_id, id, summary, location,
+                           start_ms, end_ms, all_day, response_status, conference_uri
+                    FROM events
+                    WHERE account_email = ?1 AND start_ms < ?2 AND end_ms > ?3
+                    ORDER BY start_ms ASC",
+        None => "SELECT account_email, calendar_id, id, summary, location,
+                        start_ms, end_ms, all_day, response_status, conference_uri
+                 FROM events
+                 WHERE start_ms < ?1 AND end_ms > ?2
+                 ORDER BY start_ms ASC",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    #[derive(Serialize)]
+    struct EvRow {
+        account_email: String,
+        calendar_id: String,
+        id: String,
+        summary: String,
+        location: Option<String>,
+        start_ms: i64,
+        end_ms: i64,
+        all_day: bool,
+        response_status: Option<String>,
+        conference_uri: Option<String>,
+    }
+    let map = |r: &rusqlite::Row| {
+        Ok(EvRow {
+            account_email: r.get(0)?,
+            calendar_id: r.get(1)?,
+            id: r.get(2)?,
+            summary: r.get(3)?,
+            location: r.get(4)?,
+            start_ms: r.get(5)?,
+            end_ms: r.get(6)?,
+            all_day: r.get::<_, i64>(7)? != 0,
+            response_status: r.get(8)?,
+            conference_uri: r.get(9)?,
+        })
+    };
+    let rows: Vec<EvRow> = match email {
+        Some(e) => stmt
+            .query_map(params![e, to_ms, from_ms], map)?
+            .filter_map(Result::ok)
+            .collect(),
+        None => stmt
+            .query_map(params![to_ms, from_ms], map)?
+            .filter_map(Result::ok)
+            .collect(),
+    };
+    if json {
+        return print_json(&rows);
+    }
+    for r in rows {
+        let fmt = |ms: i64| {
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .map(|d| {
+                    if r.all_day {
+                        d.format("%Y-%m-%d").to_string()
+                    } else {
+                        d.format("%Y-%m-%d %H:%M").to_string()
+                    }
+                })
+                .unwrap_or_else(|| "?".into())
+        };
+        let resp = r.response_status.as_deref().unwrap_or("");
+        println!(
+            "{}  {:5.5}  {}  {}",
+            fmt(r.start_ms),
+            resp,
+            r.summary,
+            r.location.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_cal_rsvp(
+    state: &AppState,
+    email: &str,
+    calendar_id: &str,
+    event_id: &str,
+    status: &str,
+) -> Result<()> {
+    let token = gmail::auth::access_token(
+        &state.token_cache,
+        &state.oauth_config,
+        &state.http,
+        email,
+    )
+    .await?;
+    let ev = gcal::events::respond_to_event(
+        &state.http,
+        &token,
+        calendar_id,
+        event_id,
+        email,
+        status,
+    )
+    .await?;
+    let self_status = ev
+        .attendees
+        .iter()
+        .find(|a| a.self_field == Some(true) || a.email.eq_ignore_ascii_case(email))
+        .and_then(|a| a.response_status.clone());
+    let conn = state.db.lock().map_err(|e| anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE events SET response_status = ?1
+         WHERE account_email = ?2 AND calendar_id = ?3 AND id = ?4",
+        params![self_status, email, calendar_id, event_id],
+    )?;
+    println!("ok");
     Ok(())
 }
 

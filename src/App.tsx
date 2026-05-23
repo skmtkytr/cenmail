@@ -1,5 +1,4 @@
 import {
-  For,
   Show,
   createEffect,
   createMemo,
@@ -20,18 +19,35 @@ import {
   cacheKey,
   classifyBucket,
   extractEmailAddresses,
-  formatRelativeDate,
   matchesFolder,
   parseFromHeader,
   prefixSubject,
   type AccountSelection,
   type Bucket,
 } from "./utils";
-import { sanitizeMessageHtml } from "./htmlSanitize";
+import {
+  FOLDERS as folders,
+  snoozePresets,
+  type Account,
+  type ComposeState,
+  type MessageDetail,
+  type MessageMeta,
+  type SyncDone,
+  type SyncError,
+  type SyncProgress,
+  type SyncState,
+} from "./types";
 import { ToastContainer, showToast, triggerLastAction } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
 import { settings, notificationsEnabledFor } from "./settings";
 import { SettingsModal } from "./settingsModal";
+import { CalendarPane } from "./calendarPane";
+import { ShortcutsHelpModal } from "./shortcutsHelp";
+import { ContextMenu, type TriageActions } from "./contextMenu";
+import { ComposeModal } from "./composeModal";
+import { MessagePreview } from "./messagePreview";
+import { MessageList } from "./messageList";
+import { Sidebar } from "./sidebar";
 import "./App.css";
 
 const DRAFT_STORAGE_KEY = "cenmail:compose-draft";
@@ -49,73 +65,6 @@ function usePrefersDark(): () => boolean {
   return dark;
 }
 
-type Account = {
-  id: number;
-  email: string;
-  display_name: string | null;
-  picture_url: string | null;
-  provider: string;
-  created_at: string;
-};
-
-type MessageMeta = {
-  id: string;
-  thread_id: string | null;
-  from: string;
-  subject: string;
-  snippet: string;
-  date_millis: number;
-  unread: boolean;
-  label_ids: string[];
-  account_email: string;
-};
-
-type MessageDetail = {
-  id: string;
-  thread_id: string | null;
-  from: string;
-  to: string;
-  cc: string;
-  subject: string;
-  date: string;
-  message_id_header: string;
-  references: string;
-  html_body: string | null;
-  text_body: string | null;
-};
-
-type ComposeState = {
-  from_account: string;
-  to: string;
-  cc: string;
-  bcc: string;
-  subject: string;
-  body: string;
-  in_reply_to: string | null;
-  references: string | null;
-  show_cc_bcc: boolean;
-};
-
-type SyncProgress = { email: string; fetched: number; total: number };
-type SyncDone = { email: string; total: number };
-type SyncError = { email: string; error: string };
-
-type SyncState = {
-  fetched: number;
-  total: number;
-  status: "idle" | "syncing" | "done" | "error";
-  error?: string;
-};
-
-type Folder = { id: string; label: string };
-const folders: Folder[] = [
-  { id: "inbox", label: "Inbox" },
-  { id: "pinned", label: "Pinned" },
-  { id: "snoozed", label: "Snoozed" },
-  { id: "sent", label: "Sent" },
-  { id: "archive", label: "Archive" },
-  { id: "trash", label: "Trash" },
-];
 
 function quoteForReply(detail: MessageDetail): string {
   const original = detail.text_body ?? stripHtml(detail.html_body ?? "");
@@ -163,6 +112,7 @@ function App() {
     new Set(),
   );
   const [settingsOpen, setSettingsOpen] = createSignal(false);
+  const [viewMode, setViewMode] = createSignal<"mail" | "calendar">("mail");
 
   // Apply explicit theme override to <html data-theme=...>.
   createEffect(() => {
@@ -731,28 +681,6 @@ function App() {
     });
   }
 
-  function snoozePresets(): Array<{ label: string; fireAt: number }> {
-    const now = new Date();
-    const inOneHour = now.getTime() + 60 * 60 * 1000;
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(9, 0, 0, 0);
-    const nextMonday = new Date(now);
-    const daysUntilMonday = ((1 + 7 - nextMonday.getDay()) % 7) || 7;
-    nextMonday.setDate(nextMonday.getDate() + daysUntilMonday);
-    nextMonday.setHours(9, 0, 0, 0);
-    const thisEvening = new Date(now);
-    thisEvening.setHours(18, 0, 0, 0);
-    return [
-      { label: "1 hour", fireAt: inOneHour },
-      ...(thisEvening.getTime() > now.getTime() + 30 * 60 * 1000
-        ? [{ label: "This evening (6pm)", fireAt: thisEvening.getTime() }]
-        : []),
-      { label: "Tomorrow 9am", fireAt: tomorrow.getTime() },
-      { label: "Next Monday 9am", fireAt: nextMonday.getTime() },
-    ];
-  }
-
   async function snoozeMessages(targets: MessageMeta[], fireAtMs: number) {
     if (targets.length === 0) return;
     for (const t of targets) {
@@ -824,6 +752,57 @@ function App() {
     } catch (err) {
       showToast({ message: `Mute failed: ${err}`, variant: "error" });
     }
+  }
+
+  function spamWithUndo(targets: MessageMeta[]) {
+    if (targets.length === 0) return;
+    const snapshot = targets.slice();
+    for (const t of targets) {
+      applyLocalLabelChange(t, ["SPAM"], ["INBOX", "UNREAD"]);
+      void invoke("modify_message", {
+        email: t.account_email,
+        messageId: t.id,
+        addLabels: ["SPAM"],
+        removeLabels: ["INBOX", "UNREAD"],
+      }).catch((err) => {
+        showToast({ message: `Spam failed: ${err}`, variant: "error" });
+        reloadAllVisible();
+      });
+    }
+    showToast({
+      message:
+        snapshot.length === 1
+          ? "Marked as spam"
+          : `Marked ${snapshot.length} as spam`,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          for (const t of snapshot) {
+            void invoke("modify_message", {
+              email: t.account_email,
+              messageId: t.id,
+              addLabels: ["INBOX"],
+              removeLabels: ["SPAM"],
+            });
+          }
+          reloadAllVisible();
+        },
+      },
+    });
+  }
+
+  function notSpam(message: MessageMeta) {
+    applyLocalLabelChange(message, ["INBOX"], ["SPAM"]);
+    void invoke("modify_message", {
+      email: message.account_email,
+      messageId: message.id,
+      addLabels: ["INBOX"],
+      removeLabels: ["SPAM"],
+    }).catch((err) => {
+      showToast({ message: `Restore failed: ${err}`, variant: "error" });
+      reloadAllVisible();
+    });
+    showToast({ message: "Moved out of Spam" });
   }
 
   function starToggleWithUndo(targets: MessageMeta[]) {
@@ -970,7 +949,6 @@ function App() {
 
   const [compose, setCompose] = createSignal<ComposeState | null>(null);
   const [sendError, setSendError] = createSignal<string | null>(null);
-  const [scheduleMenuOpen, setScheduleMenuOpen] = createSignal(false);
 
   async function scheduleCurrentCompose(fireAtMs: number) {
     const cur = compose();
@@ -1267,6 +1245,24 @@ function App() {
     setContextMenu({ x: e.clientX, y: e.clientY, message });
   }
 
+  const triageActions: TriageActions = {
+    toggleRead: (m) =>
+      void modifyLabels(
+        m,
+        m.unread ? [] : ["UNREAD"],
+        m.unread ? ["UNREAD"] : [],
+      ),
+    toggleStar: (m) => starToggleWithUndo([m]),
+    archive: (m) => archiveWithUndo([m]),
+    trash: (m) => trashWithUndo([m]),
+    restoreFromTrash: (m) => void modifyLabels(m, [], ["TRASH"]),
+    moveToInbox: (m) => void modifyLabels(m, ["INBOX"], []),
+    markSpam: (m) => spamWithUndo([m]),
+    notSpam: (m) => notSpam(m),
+    snooze: (m, fireAt) => void snoozeMessages([m], fireAt),
+    mute: (m) => void muteThreadAction(m),
+  };
+
   const [showShortcuts, setShowShortcuts] = createSignal(false);
 
   function currentMessage(): MessageMeta | null {
@@ -1329,6 +1325,25 @@ function App() {
     ) {
       e.preventDefault();
       handleRefresh();
+      return;
+    }
+    // Global view switch: Ctrl+Shift+1 (Mail) / Ctrl+Shift+2 (Calendar).
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.shiftKey &&
+      (e.key === "1" || e.key === "!")
+    ) {
+      e.preventDefault();
+      setViewMode("mail");
+      return;
+    }
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.shiftKey &&
+      (e.key === "2" || e.key === "@")
+    ) {
+      e.preventDefault();
+      setViewMode("calendar");
       return;
     }
 
@@ -1491,165 +1506,26 @@ function App() {
 
   return (
     <div class="flex h-full w-full text-[color:var(--color-fg)]">
-      <aside
-        class="flex shrink-0 flex-col border-r border-[color:var(--color-border)] bg-[color:var(--color-surface)]"
-        style={{ width: `${sidebarWidth()}px` }}
-      >
-        <div class="flex items-center justify-between px-4 py-3">
-          <span class="text-sm font-semibold tracking-wide">cenmail</span>
-          <div class="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              title="Settings"
-              class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
-              aria-label="Settings"
-            >
-              ⚙
-            </button>
-            <button
-              type="button"
-              onClick={handleRefresh}
-              title="Sync now"
-              class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
-              aria-label="Sync now"
-            >
-              ↻
-            </button>
-          </div>
-        </div>
-        <div class="px-2 pb-2">
-          <button
-            type="button"
-            onClick={openCompose}
-            disabled={(accounts() ?? []).length === 0}
-            class="flex w-full items-center justify-center gap-2 rounded bg-[color:var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            ✎ Compose
-          </button>
-        </div>
-
-        <div class="px-2">
-          <button
-            type="button"
-            onClick={() => setSelectedAccount("all")}
-            class={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-[color:var(--color-surface-hover)] ${
-              selectedAccount() === "all"
-                ? "bg-[color:var(--color-surface-active)] font-medium"
-                : ""
-            }`}
-          >
-            <div class="flex size-6 shrink-0 items-center justify-center rounded-full bg-zinc-400 text-xs text-white">
-              ∞
-            </div>
-            <span class="truncate">All Inboxes</span>
-          </button>
-          <For each={accounts() ?? []}>
-            {(a) => {
-              const isActive = () => selectedAccount() === a.id;
-              const state = (): SyncState | undefined => syncState[a.email];
-              return (
-                <div
-                  class={`group flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)] ${
-                    isActive()
-                      ? "bg-[color:var(--color-surface-active)] font-medium"
-                      : ""
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setSelectedAccount(a.id)}
-                    class="flex flex-1 items-center gap-2 overflow-hidden text-left"
-                  >
-                    <Show
-                      when={a.picture_url}
-                      fallback={
-                        <div class="flex size-6 shrink-0 items-center justify-center rounded-full bg-zinc-300 text-xs text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
-                          {a.email.charAt(0).toUpperCase()}
-                        </div>
-                      }
-                    >
-                      <img
-                        src={a.picture_url ?? ""}
-                        class="size-6 shrink-0 rounded-full object-cover"
-                        alt=""
-                        referrerpolicy="no-referrer"
-                      />
-                    </Show>
-                    <span class="truncate">{a.email}</span>
-                    <Show when={state()?.status === "syncing"}>
-                      <span class="ml-auto text-xs text-[color:var(--color-muted)]">
-                        ↻
-                      </span>
-                    </Show>
-                    <Show when={state()?.status === "error"}>
-                      <span
-                        class="ml-auto text-xs text-red-500"
-                        title={state()?.error}
-                      >
-                        !
-                      </span>
-                    </Show>
-                  </button>
-                  <button
-                    type="button"
-                    title="Remove account"
-                    onClick={() => handleRemoveAccount(a.id)}
-                    class="hidden text-[color:var(--color-muted)] hover:text-red-500 group-hover:block"
-                    aria-label={`Remove ${a.email}`}
-                  >
-                    ×
-                  </button>
-                </div>
-              );
-            }}
-          </For>
-          <button
-            type="button"
-            onClick={handleAddAccount}
-            disabled={addingAccount()}
-            class="mt-1 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)] disabled:opacity-50"
-          >
-            <span class="size-2 rounded-full border border-current" />
-            <span>{addingAccount() ? "Authorizing…" : "+ Add account"}</span>
-          </button>
-          <Show when={addError()}>
-            <div class="mt-2 rounded border border-red-400 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:bg-red-950 dark:text-red-200">
-              {addError()}
-            </div>
-          </Show>
-        </div>
-
-        <nav class="mt-4 flex-1 overflow-y-auto px-2">
-          <For each={folders}>
-            {(f) => {
-              const active = () => selectedFolder() === f.id;
-              return (
-                <button
-                  type="button"
-                  onClick={() => setSelectedFolder(f.id)}
-                  class={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-sm hover:bg-[color:var(--color-surface-hover)] ${
-                    active()
-                      ? "bg-[color:var(--color-surface-active)] font-medium"
-                      : ""
-                  }`}
-                >
-                  <span>{f.label}</span>
-                </button>
-              );
-            }}
-          </For>
-        </nav>
-        <div class="border-t border-[color:var(--color-border)] px-4 py-2 text-xs text-[color:var(--color-muted)]">
-          <Show when={aggregateSync()} fallback={<span>Idle</span>}>
-            {(s) => (
-              <span class={s().syncing ? "text-[color:var(--color-accent)]" : ""}>
-                {s().label}
-              </span>
-            )}
-          </Show>
-        </div>
-      </aside>
+      <Sidebar
+        width={sidebarWidth()}
+        accounts={accounts() ?? []}
+        folders={folders}
+        viewMode={viewMode()}
+        setViewMode={setViewMode}
+        selectedAccount={selectedAccount()}
+        setSelectedAccount={setSelectedAccount}
+        selectedFolder={selectedFolder()}
+        setSelectedFolder={setSelectedFolder}
+        syncState={syncState}
+        aggregateSync={aggregateSync() ?? null}
+        addingAccount={addingAccount()}
+        addError={addError()}
+        onAddAccount={handleAddAccount}
+        onRemoveAccount={handleRemoveAccount}
+        onCompose={openCompose}
+        onRefresh={handleRefresh}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
 
       <div
         onMouseDown={(e) => startResize(e, "sidebar")}
@@ -1659,249 +1535,39 @@ function App() {
         <span class="pointer-events-none absolute inset-y-0 -left-1 -right-1" />
       </div>
 
-      <section
-        class="flex shrink-0 flex-col border-r border-[color:var(--color-border)] bg-[color:var(--color-bg)]"
-        style={{ width: `${listWidth()}px` }}
-      >
-        <header class="flex items-center justify-between gap-2 px-4 py-3">
-          <h2 class="truncate text-sm font-semibold">{headerTitle()}</h2>
-          <div class="flex shrink-0 items-center gap-2 text-xs text-[color:var(--color-muted)]">
-            <span>
-              {messagesLoading()
-                ? `${visibleMessages().length} ↻`
-                : `${visibleMessages().length.toLocaleString()} messages`}
-            </span>
-            <button
-              type="button"
-              onClick={() => setShowShortcuts(true)}
-              title="Keyboard shortcuts (?)"
-              aria-label="Keyboard shortcuts"
-              class="rounded border border-[color:var(--color-border)] px-1.5 py-0.5 font-mono text-[10px] hover:bg-[color:var(--color-surface-hover)]"
-            >
-              ?
-            </button>
-          </div>
-        </header>
-        <div class="px-4 pb-2">
-          <div class="flex items-center gap-2 rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 text-sm focus-within:border-[color:var(--color-accent)]">
-            <span class="text-[color:var(--color-muted)]">⌕</span>
-            <input
-              ref={(el) => (searchInputRef = el)}
-              value={searchQuery()}
-              onInput={(e) => handleSearchInput(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  e.stopPropagation();
-                  if (searchQuery().length > 0) {
-                    clearSearch();
-                  } else {
-                    (e.currentTarget as HTMLInputElement).blur();
-                  }
-                }
-              }}
-              placeholder="Search subject / from / snippet"
-              class="flex-1 bg-transparent outline-none placeholder:text-[color:var(--color-muted)]"
-            />
-            <Show when={searchQuery().length > 0}>
-              <button
-                type="button"
-                onClick={clearSearch}
-                class="text-xs text-[color:var(--color-muted)] hover:text-[color:var(--color-fg)]"
-                aria-label="Clear search"
-              >
-                ×
-              </button>
-            </Show>
-          </div>
-        </div>
-        <Show when={messagesError()}>
-          <div class="mx-4 mb-2 rounded border border-red-400 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:bg-red-950 dark:text-red-200">
-            {messagesError()}
-          </div>
-        </Show>
-        <Show when={selectedFolder() === "inbox"}>
-          <div class="flex shrink-0 gap-1 border-b border-[color:var(--color-border)] px-3 py-1.5 text-xs">
-            <For
-              each={
-                [
-                  { id: "all" as const, label: "All", count: null },
-                  {
-                    id: "personal" as const,
-                    label: "Personal",
-                    count: bucketCounts().personal,
-                  },
-                  {
-                    id: "newsletters" as const,
-                    label: "Newsletters",
-                    count: bucketCounts().newsletters,
-                  },
-                  {
-                    id: "notifications" as const,
-                    label: "Notifications",
-                    count: bucketCounts().notifications,
-                  },
-                ]
-              }
-            >
-              {(b) => {
-                const active = () => selectedBucket() === b.id;
-                return (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedBucket(b.id)}
-                    class={`flex items-center gap-1.5 rounded-full px-2.5 py-1 ${
-                      active()
-                        ? "bg-[color:var(--color-accent-bg)] text-[color:var(--color-fg)] font-medium"
-                        : "text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
-                    }`}
-                  >
-                    <span>{b.label}</span>
-                    <Show when={b.count !== null && b.count > 0}>
-                      <span class="text-[color:var(--color-muted)]">
-                        {b.count}
-                      </span>
-                    </Show>
-                  </button>
-                );
-              }}
-            </For>
-          </div>
-        </Show>
-        <ul class="flex-1 overflow-y-auto">
-          <Show
-            when={
-              !messagesLoading() && hasCache() && visibleMessages().length === 0
-            }
-          >
-            <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
-              {(accounts() ?? []).length === 0
-                ? "Add an account to get started."
-                : aggregateSync()?.syncing
-                  ? "Syncing…"
-                  : "No messages."}
-            </li>
-          </Show>
-          <Show when={messagesLoading() && !hasCache()}>
-            <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
-              Loading…
-            </li>
-          </Show>
-          <For each={visibleMessages()}>
-            {(m) => {
-              const active = () => selectedMessageId() === m.id;
-              const fromParsed = () => parseFromHeader(m.from);
-              return (
-                <li
-                  onClick={(e) => handleListClick(e, m)}
-                  onContextMenu={(e) => {
-                    if (!isSelected(m.id)) {
-                      setSelectedIds(new Set([m.id]));
-                      setAnchorId(m.id);
-                    }
-                    openContextMenu(e, m);
-                  }}
-                  class={`group flex cursor-pointer select-none items-start gap-3 border-b border-[color:var(--color-border)] px-4 py-3 hover:bg-[color:var(--color-surface-hover)] ${
-                    isSelected(m.id)
-                      ? "bg-[color:var(--color-accent-bg)]"
-                      : ""
-                  } ${
-                    active() && !isSelected(m.id)
-                      ? "ring-1 ring-inset ring-[color:var(--color-accent)]"
-                      : ""
-                  }`}
-                >
-                  {(() => {
-                    const acct = (accounts() ?? []).find(
-                      (a) => a.email === m.account_email,
-                    );
-                    return acct?.picture_url ? (
-                      <img
-                        src={acct.picture_url}
-                        class="size-6 shrink-0 rounded-full object-cover"
-                        alt=""
-                        title={m.account_email}
-                        referrerpolicy="no-referrer"
-                      />
-                    ) : (
-                      <div
-                        class="flex size-6 shrink-0 items-center justify-center rounded-full bg-zinc-300 text-xs text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300"
-                        title={m.account_email}
-                      >
-                        {m.account_email.charAt(0).toUpperCase()}
-                      </div>
-                    );
-                  })()}
-                  <div
-                    class={`flex w-1.5 shrink-0 self-stretch items-center justify-center ${
-                      m.unread ? "" : "invisible"
-                    }`}
-                  >
-                    <span class="size-1.5 rounded-full bg-[color:var(--color-accent)]" />
-                  </div>
-                  <div
-                    class={`min-w-0 flex-1 ${
-                      m.unread ? "" : "text-[color:var(--color-muted)]"
-                    }`}
-                  >
-                    <div class="flex justify-between gap-2">
-                      <span
-                        class={`truncate text-sm ${
-                          m.unread
-                            ? "font-semibold text-[color:var(--color-fg)]"
-                            : ""
-                        }`}
-                      >
-                        {fromParsed().name}
-                      </span>
-                      <div class="flex shrink-0 items-center gap-1.5 text-xs">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            starToggleWithUndo([m]);
-                          }}
-                          title={
-                            m.label_ids.includes("STARRED")
-                              ? "Remove star"
-                              : "Star"
-                          }
-                          aria-label={
-                            m.label_ids.includes("STARRED")
-                              ? "Remove star"
-                              : "Star"
-                          }
-                          class={`text-sm leading-none ${
-                            m.label_ids.includes("STARRED")
-                              ? "text-yellow-500"
-                              : "text-transparent group-hover:text-[color:var(--color-muted)] hover:!text-yellow-500"
-                          }`}
-                        >
-                          ★
-                        </button>
-                        <span title={new Date(m.date_millis).toLocaleString()}>
-                          {formatRelativeDate(m.date_millis)}
-                        </span>
-                      </div>
-                    </div>
-                    <div
-                      class={`truncate text-sm ${
-                        m.unread
-                          ? "font-medium text-[color:var(--color-fg)]"
-                          : ""
-                      }`}
-                    >
-                      {m.subject || "(no subject)"}
-                    </div>
-                    <div class="truncate text-xs text-[color:var(--color-muted)]">
-                      {m.snippet}
-                    </div>
-                  </div>
-                </li>
-              );
-            }}
-          </For>
-        </ul>
-      </section>
+      <Show when={viewMode() === "calendar"}>
+        <CalendarPane accounts={accounts() ?? []} />
+      </Show>
+
+      <Show when={viewMode() === "mail"}>
+      <MessageList
+        width={listWidth()}
+        accounts={accounts() ?? []}
+        headerTitle={headerTitle()}
+        messages={visibleMessages()}
+        messagesLoading={messagesLoading()}
+        hasCache={hasCache()}
+        messagesError={messagesError()}
+        selectedMessageId={selectedMessageId()}
+        selectedFolder={selectedFolder()}
+        selectedBucket={selectedBucket()}
+        setSelectedBucket={setSelectedBucket}
+        bucketCounts={bucketCounts()}
+        searchQuery={searchQuery()}
+        onSearchInput={handleSearchInput}
+        onClearSearch={clearSearch}
+        setSearchInputRef={(el) => (searchInputRef = el)}
+        syncingHint={!!aggregateSync()?.syncing}
+        onShowShortcuts={() => setShowShortcuts(true)}
+        isSelected={isSelected}
+        onRowClick={(e, m) => handleListClick(e, m)}
+        onContextMenu={(e, m) => openContextMenu(e, m)}
+        onSelectOnlyForContext={(m) => {
+          setSelectedIds(new Set([m.id]));
+          setAnchorId(m.id);
+        }}
+        onToggleStar={(m) => starToggleWithUndo([m])}
+      />
 
       <div
         onMouseDown={(e) => startResize(e, "list")}
@@ -1911,641 +1577,43 @@ function App() {
         <span class="pointer-events-none absolute inset-y-0 -left-1 -right-1" />
       </div>
 
-      <section class="flex min-w-0 flex-1 flex-col bg-[color:var(--color-surface)]">
-        <Show
-          when={selectedMessageId()}
-          fallback={
-            <div class="flex flex-1 items-center justify-center text-sm text-[color:var(--color-muted)]">
-              Select a message to read.
-            </div>
-          }
-        >
-          <Show when={messageDetailLoading() && threadDetails().length === 0}>
-            <div class="flex flex-1 items-center justify-center text-sm text-[color:var(--color-muted)]">
-              Loading…
-            </div>
-          </Show>
-          <Show when={messageDetailError() && threadDetails().length === 0}>
-            <div class="flex flex-1 items-center justify-center p-6">
-              <div class="rounded border border-red-400 bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
-                {messageDetailError()}
-              </div>
-            </div>
-          </Show>
-          <Show when={messageDetail() && threadDetails().length > 0}>
-            <header class="shrink-0 border-b border-[color:var(--color-border)] px-6 py-4">
-              <div class="flex items-start justify-between gap-4">
-                <h1 class="text-lg font-semibold">
-                  {(latestInThread() ?? messageDetail())?.subject ||
-                    "(no subject)"}
-                </h1>
-                <div class="flex shrink-0 items-center gap-2">
-                  <Show when={threadDetails().length > 1}>
-                    <span class="rounded-full bg-[color:var(--color-surface-active)] px-2 py-0.5 text-xs text-[color:var(--color-muted)]">
-                      {threadDetails().length} messages
-                    </span>
-                  </Show>
-                  <button
-                    type="button"
-                    onClick={() => openReply(false)}
-                    class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                  >
-                    Reply
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => openReply(true)}
-                    class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                  >
-                    Reply all
-                  </button>
-                  <button
-                    type="button"
-                    onClick={openForward}
-                    class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                  >
-                    Forward
-                  </button>
-                </div>
-              </div>
-            </header>
-            <div class="flex min-h-0 flex-1 flex-col overflow-y-auto">
-              <For each={threadDetails()}>
-                {(d, i) => {
-                  const expanded = () => expandedInThread().has(d.id);
-                  const allowed = () =>
-                    settings().privacy.alwaysAllowImages ||
-                    allowImagesFor().has(d.id);
-                  const sanitized = createMemo(() =>
-                    sanitizeMessageHtml(d.html_body ?? "", {
-                      allowRemoteImages: allowed(),
-                      dark: prefersDark(),
-                    }),
-                  );
-                  const isLast = () => i() === threadDetails().length - 1;
-                  const fillsRemaining = () => expanded() && isLast();
-                  return (
-                    <article
-                      class={`flex flex-col border-b border-[color:var(--color-border)] ${
-                        fillsRemaining() ? "min-h-0 flex-1" : "shrink-0"
-                      }`}
-                    >
-                      <header
-                        onClick={() => toggleThreadExpanded(d.id)}
-                        class="flex shrink-0 cursor-pointer items-baseline justify-between gap-4 px-6 py-3 hover:bg-[color:var(--color-surface-hover)]"
-                      >
-                        <div class="min-w-0 flex-1">
-                          <div class="truncate text-sm">
-                            <span class="font-medium">
-                              {parseFromHeader(d.from).name}
-                            </span>{" "}
-                            <span class="text-[color:var(--color-muted)]">
-                              &lt;{parseFromHeader(d.from).email}&gt;
-                            </span>
-                          </div>
-                          <Show when={!expanded()}>
-                            <div class="truncate text-xs text-[color:var(--color-muted)]">
-                              {(d.text_body ?? d.html_body ?? "")
-                                .replace(/<[^>]+>/g, " ")
-                                .replace(/\s+/g, " ")
-                                .slice(0, 160)}
-                            </div>
-                          </Show>
-                        </div>
-                        <span class="shrink-0 text-xs text-[color:var(--color-muted)]">
-                          {d.date}
-                        </span>
-                      </header>
-                      <Show when={expanded()}>
-                        <div
-                          class={`flex flex-col border-t border-[color:var(--color-border)] ${
-                            fillsRemaining() ? "min-h-0 flex-1" : ""
-                          }`}
-                        >
-                          <Show
-                            when={d.html_body}
-                            fallback={
-                              <pre
-                                class={`whitespace-pre-wrap p-6 font-sans text-sm ${
-                                  fillsRemaining()
-                                    ? "min-h-0 flex-1 overflow-auto"
-                                    : "max-h-[60vh] overflow-auto"
-                                }`}
-                              >
-                                {d.text_body || "(no body)"}
-                              </pre>
-                            }
-                          >
-                            <Show
-                              when={
-                                !allowed() && sanitized().blockedImages > 0
-                              }
-                            >
-                              <div class="flex shrink-0 items-center justify-between bg-[color:var(--color-bg)] px-6 py-2 text-xs text-[color:var(--color-muted)]">
-                                <span>
-                                  Remote images blocked to protect your
-                                  privacy.
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const next = new Set(allowImagesFor());
-                                    next.add(d.id);
-                                    setAllowImagesFor(next);
-                                  }}
-                                  class="rounded border border-[color:var(--color-border)] px-2 py-0.5 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                                >
-                                  Show images
-                                </button>
-                              </div>
-                            </Show>
-                            <iframe
-                              srcdoc={sanitized().html}
-                              sandbox="allow-popups allow-popups-to-escape-sandbox"
-                              class={`w-full border-0 ${
-                                fillsRemaining()
-                                  ? "min-h-0 flex-1"
-                                  : "h-[60vh]"
-                              } ${
-                                prefersDark()
-                                  ? "bg-[color:var(--color-surface)]"
-                                  : "bg-white"
-                              }`}
-                              title="message body"
-                            />
-                          </Show>
-                        </div>
-                      </Show>
-                    </article>
-                  );
-                }}
-              </For>
-            </div>
-          </Show>
-        </Show>
-      </section>
-
-      <Show when={contextMenu()}>
-        {(cm) => {
-          const m = cm().message;
-          const isStarred = () => m.label_ids.includes("STARRED");
-          const inTrash = () => m.label_ids.includes("TRASH");
-          const inInbox = () => m.label_ids.includes("INBOX");
-          return (
-            <ul
-              role="menu"
-              class="fixed z-50 min-w-44 rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] py-1 text-sm shadow-lg"
-              style={{ left: `${cm().x}px`, top: `${cm().y}px` }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <li>
-                <button
-                  type="button"
-                  class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                  onClick={() => {
-                    closeContextMenu();
-                    void modifyLabels(
-                      m,
-                      m.unread ? [] : ["UNREAD"],
-                      m.unread ? ["UNREAD"] : [],
-                    );
-                  }}
-                >
-                  {m.unread ? "Mark as read" : "Mark as unread"}
-                </button>
-              </li>
-              <li>
-                <button
-                  type="button"
-                  class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                  onClick={() => {
-                    closeContextMenu();
-                    starToggleWithUndo([m]);
-                  }}
-                >
-                  {isStarred() ? "Remove star" : "Star"}
-                </button>
-              </li>
-              <Show when={inInbox()}>
-                <li>
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                    onClick={() => {
-                      closeContextMenu();
-                      archiveWithUndo([m]);
-                    }}
-                  >
-                    Archive
-                  </button>
-                </li>
-                <li class="border-t border-[color:var(--color-border)] mt-1 pt-1">
-                  <div class="px-3 pb-1 text-xs text-[color:var(--color-muted)]">
-                    Snooze until
-                  </div>
-                  <For each={snoozePresets()}>
-                    {(p) => (
-                      <button
-                        type="button"
-                        class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                        onClick={() => {
-                          closeContextMenu();
-                          void snoozeMessages([m], p.fireAt);
-                        }}
-                      >
-                        {p.label}
-                      </button>
-                    )}
-                  </For>
-                </li>
-                <li class="border-t border-[color:var(--color-border)] mt-1">
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                    onClick={() => {
-                      closeContextMenu();
-                      void muteThreadAction(m);
-                    }}
-                  >
-                    Mute thread
-                  </button>
-                </li>
-              </Show>
-              <Show when={!inInbox() && !inTrash()}>
-                <li>
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                    onClick={() => {
-                      closeContextMenu();
-                      void modifyLabels(m, ["INBOX"], []);
-                    }}
-                  >
-                    Move to Inbox
-                  </button>
-                </li>
-              </Show>
-              <li>
-                <button
-                  type="button"
-                  class="block w-full px-3 py-1.5 text-left text-red-500 hover:bg-[color:var(--color-surface-hover)]"
-                  onClick={() => {
-                    closeContextMenu();
-                    if (inTrash()) {
-                      void modifyLabels(m, [], ["TRASH"]);
-                    } else {
-                      trashWithUndo([m]);
-                    }
-                  }}
-                >
-                  {inTrash() ? "Restore from Trash" : "Move to Trash"}
-                </button>
-              </li>
-            </ul>
-          );
-        }}
+      <MessagePreview
+        selectedMessageId={selectedMessageId()}
+        messageDetailLoading={messageDetailLoading()}
+        messageDetailError={messageDetailError()}
+        messageDetail={messageDetail()}
+        threadDetails={threadDetails()}
+        latestInThread={latestInThread()}
+        currentMessageAccount={currentMessage()?.account_email ?? ""}
+        expandedInThread={expandedInThread()}
+        allowImagesFor={allowImagesFor()}
+        alwaysAllowImages={settings().privacy.alwaysAllowImages}
+        prefersDark={prefersDark()}
+        toggleThreadExpanded={toggleThreadExpanded}
+        setAllowImagesFor={setAllowImagesFor}
+        onReply={openReply}
+        onForward={openForward}
+      />
       </Show>
 
-      <Show when={showShortcuts()}>
-        <div
-          class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          onClick={() => setShowShortcuts(false)}
-        >
-          <div
-            role="dialog"
-            class="w-full max-w-md rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-6 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 class="mb-4 text-lg font-semibold">Keyboard shortcuts</h2>
-            <table class="w-full text-sm">
-              <tbody>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      j
-                    </kbd>{" "}
-                    /{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      k
-                    </kbd>
-                  </td>
-                  <td>Next / previous message</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      e
-                    </kbd>
-                  </td>
-                  <td>Archive</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      #
-                    </kbd>{" "}
-                    /{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      Del
-                    </kbd>
-                  </td>
-                  <td>Move to Trash</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      s
-                    </kbd>
-                  </td>
-                  <td>Toggle star</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      z
-                    </kbd>
-                  </td>
-                  <td>Snooze 1h</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4 whitespace-nowrap">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      Ctrl
-                    </kbd>{" "}
-                    +{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      Z
-                    </kbd>
-                  </td>
-                  <td>Undo last action</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      m
-                    </kbd>
-                  </td>
-                  <td>Mute thread</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      u
-                    </kbd>
-                  </td>
-                  <td>Toggle read / unread</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      r
-                    </kbd>{" "}
-                    /{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      a
-                    </kbd>{" "}
-                    /{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      f
-                    </kbd>
-                  </td>
-                  <td>Reply / Reply all / Forward</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      c
-                    </kbd>
-                  </td>
-                  <td>Compose new</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      /
-                    </kbd>
-                  </td>
-                  <td>Search</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4 whitespace-nowrap">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      Ctrl
-                    </kbd>{" "}
-                    +{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      Shift
-                    </kbd>{" "}
-                    +{" "}
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      R
-                    </kbd>
-                  </td>
-                  <td>Sync now</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      ?
-                    </kbd>
-                  </td>
-                  <td>Show this help</td>
-                </tr>
-                <tr>
-                  <td class="py-1 pr-4">
-                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
-                      Esc
-                    </kbd>
-                  </td>
-                  <td>Close modal / deselect</td>
-                </tr>
-              </tbody>
-            </table>
-            <div class="mt-4 text-right">
-              <button
-                type="button"
-                onClick={() => setShowShortcuts(false)}
-                class="rounded border border-[color:var(--color-border)] px-3 py-1 text-sm hover:bg-[color:var(--color-surface-hover)]"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      </Show>
+      <ContextMenu
+        menu={contextMenu()}
+        onClose={closeContextMenu}
+        actions={triageActions}
+      />
 
-      <Show when={compose()}>
-        {(cs) => (
-          <div
-            class="fixed inset-0 z-40 flex items-end justify-end p-4 sm:items-center sm:justify-center sm:p-8"
-            onClick={closeCompose}
-          >
-            <div
-              class="absolute inset-0 bg-black/40"
-              aria-hidden="true"
-            />
-            <div
-              role="dialog"
-              aria-modal="true"
-              class="relative flex h-[640px] w-full max-w-3xl flex-col rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] shadow-2xl"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <header class="flex items-center justify-between border-b border-[color:var(--color-border)] px-4 py-3">
-                <span class="text-sm font-semibold">
-                  {cs().in_reply_to
-                    ? "Reply"
-                    : cs().subject.startsWith("Fwd:")
-                      ? "Forward"
-                      : "New message"}
-                </span>
-                <button
-                  type="button"
-                  onClick={closeCompose}
-                  class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
-                  aria-label="Close"
-                >
-                  ×
-                </button>
-              </header>
+      <ShortcutsHelpModal open={showShortcuts()} onClose={() => setShowShortcuts(false)} />
 
-              <div class="flex items-center gap-2 border-b border-[color:var(--color-border)] px-4 py-2 text-sm">
-                <span class="w-12 shrink-0 text-[color:var(--color-muted)]">
-                  From
-                </span>
-                <select
-                  value={cs().from_account}
-                  onChange={(e) =>
-                    updateCompose("from_account", e.currentTarget.value)
-                  }
-                  class="flex-1 bg-transparent outline-none"
-                >
-                  <For each={accounts() ?? []}>
-                    {(a) => <option value={a.email}>{a.email}</option>}
-                  </For>
-                </select>
-              </div>
 
-              <div class="flex items-center gap-2 border-b border-[color:var(--color-border)] px-4 py-2 text-sm">
-                <span class="w-12 shrink-0 text-[color:var(--color-muted)]">
-                  To
-                </span>
-                <input
-                  value={cs().to}
-                  onInput={(e) => updateCompose("to", e.currentTarget.value)}
-                  placeholder="recipient@example.com, another@example.com"
-                  class="flex-1 bg-transparent outline-none"
-                />
-                <Show when={!cs().show_cc_bcc}>
-                  <button
-                    type="button"
-                    onClick={() => updateCompose("show_cc_bcc", true)}
-                    class="text-xs text-[color:var(--color-muted)] hover:text-[color:var(--color-fg)]"
-                  >
-                    Cc / Bcc
-                  </button>
-                </Show>
-              </div>
-
-              <Show when={cs().show_cc_bcc}>
-                <div class="flex items-center gap-2 border-b border-[color:var(--color-border)] px-4 py-2 text-sm">
-                  <span class="w-12 shrink-0 text-[color:var(--color-muted)]">
-                    Cc
-                  </span>
-                  <input
-                    value={cs().cc}
-                    onInput={(e) => updateCompose("cc", e.currentTarget.value)}
-                    class="flex-1 bg-transparent outline-none"
-                  />
-                </div>
-                <div class="flex items-center gap-2 border-b border-[color:var(--color-border)] px-4 py-2 text-sm">
-                  <span class="w-12 shrink-0 text-[color:var(--color-muted)]">
-                    Bcc
-                  </span>
-                  <input
-                    value={cs().bcc}
-                    onInput={(e) => updateCompose("bcc", e.currentTarget.value)}
-                    class="flex-1 bg-transparent outline-none"
-                  />
-                </div>
-              </Show>
-
-              <div class="flex items-center gap-2 border-b border-[color:var(--color-border)] px-4 py-2 text-sm">
-                <span class="w-12 shrink-0 text-[color:var(--color-muted)]">
-                  Subject
-                </span>
-                <input
-                  value={cs().subject}
-                  onInput={(e) =>
-                    updateCompose("subject", e.currentTarget.value)
-                  }
-                  class="flex-1 bg-transparent outline-none"
-                />
-              </div>
-
-              <textarea
-                value={cs().body}
-                onInput={(e) => updateCompose("body", e.currentTarget.value)}
-                placeholder="Write your message…"
-                class="flex-1 resize-none bg-transparent p-4 text-sm leading-relaxed outline-none"
-              />
-
-              <Show when={sendError()}>
-                <div class="mx-4 mb-2 rounded border border-red-400 bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-950 dark:text-red-200">
-                  {sendError()}
-                </div>
-              </Show>
-
-              <footer class="flex items-center justify-end gap-2 border-t border-[color:var(--color-border)] px-4 py-3">
-                <div class="relative mr-auto">
-                  <button
-                    type="button"
-                    onClick={() => setScheduleMenuOpen(!scheduleMenuOpen())}
-                    class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]"
-                  >
-                    Send later ▾
-                  </button>
-                  <Show when={scheduleMenuOpen()}>
-                    <ul
-                      class="absolute bottom-full left-0 mb-1 min-w-44 rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] py-1 text-sm shadow-lg"
-                    >
-                      <For each={snoozePresets()}>
-                        {(p) => (
-                          <li>
-                            <button
-                              type="button"
-                              class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                              onClick={() => {
-                                setScheduleMenuOpen(false);
-                                void scheduleCurrentCompose(p.fireAt);
-                              }}
-                            >
-                              {p.label}
-                            </button>
-                          </li>
-                        )}
-                      </For>
-                    </ul>
-                  </Show>
-                </div>
-                <button
-                  type="button"
-                  onClick={closeCompose}
-                  class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSendCompose}
-                  class="rounded bg-[color:var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90"
-                >
-                  Send
-                </button>
-              </footer>
-            </div>
-          </div>
-        )}
-      </Show>
+      <ComposeModal
+        compose={compose()}
+        accounts={accounts() ?? []}
+        sendError={sendError()}
+        onClose={closeCompose}
+        onSend={handleSendCompose}
+        onScheduleSend={(ms) => void scheduleCurrentCompose(ms)}
+        onUpdate={updateCompose}
+      />
 
       <ToastContainer />
       <ConfirmHost />
