@@ -10,8 +10,14 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Gmail-only for 
 - Google OAuth Desktop flow (PKCE, loopback redirect); refresh token stored in the OS keyring
 - SQLite cache with incremental sync (message metadata + on-demand full bodies)
 - 3-pane layout (account/label list · message list · preview)
-- Compose / reply / reply-all / forward / send
+- Compose / reply / reply-all / forward / send (with Undo Send buffer)
+- Schedule send (in-app local queue, presets: 1h / this evening / tomorrow / next Monday)
+- Snooze with presets; messages reappear via a 60-second background timer
+- Mute thread (auto-archives all messages in the thread)
+- Smart Inbox: auto-classifies into Personal / Newsletters / Notifications tabs
+- Threaded conversation view in the preview pane
 - Archive, trash / untrash, star, mark read / unread, label modify
+- Desktop notifications for new Personal-bucket mail
 - Full-text search (Gmail `q` syntax passed through)
 - Keyboard-driven UI
 
@@ -24,6 +30,9 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Gmail-only for 
 | `#` / `Del` | Move to Trash |
 | `s` | Toggle star |
 | `u` | Toggle read / unread |
+| `z` | Snooze (1 hour) |
+| `m` | Mute thread |
+| `Ctrl`+`Z` | Undo last action (archive / trash / snooze / star) |
 | `r` / `a` / `f` | Reply / Reply all / Forward |
 | `c` | Compose new |
 | `/` | Search |

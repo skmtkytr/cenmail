@@ -37,6 +37,22 @@ export function dismissToast(id: number) {
   setToasts(toasts().filter((t) => t.id !== id));
 }
 
+// Fire the action of the most recent toast that has one. Returns true if it
+// did. Use for Ctrl/Cmd+Z bindings — only the freshest action is undoable, by
+// design (matches Spark/Gmail behavior).
+export function triggerLastAction(): boolean {
+  const list = toasts();
+  for (let i = list.length - 1; i >= 0; i--) {
+    const t = list[i];
+    if (t.action) {
+      t.action.onClick();
+      dismissToast(t.id);
+      return true;
+    }
+  }
+  return false;
+}
+
 export function ToastContainer() {
   return (
     <div

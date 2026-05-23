@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   cacheKey,
+  classifyBucket,
   colorForEmail,
   extractEmailAddresses,
   formatRelativeDate,
@@ -149,6 +150,109 @@ describe("formatRelativeDate", () => {
       now,
     );
     expect(out).toMatch(/2024/);
+  });
+});
+
+describe("classifyBucket", () => {
+  it("classifies CATEGORY_PROMOTIONS as newsletters", () => {
+    expect(
+      classifyBucket({
+        from: "Brand <hello@brand.com>",
+        label_ids: ["INBOX", "CATEGORY_PROMOTIONS"],
+      }),
+    ).toBe("newsletters");
+  });
+
+  it("classifies CATEGORY_SOCIAL as notifications", () => {
+    expect(
+      classifyBucket({
+        from: "LinkedIn <noreply@linkedin.com>",
+        label_ids: ["INBOX", "CATEGORY_SOCIAL"],
+      }),
+    ).toBe("notifications");
+  });
+
+  it("classifies no-reply senders as notifications", () => {
+    expect(
+      classifyBucket({
+        from: "Stripe <no-reply@stripe.com>",
+        label_ids: ["INBOX"],
+      }),
+    ).toBe("notifications");
+  });
+
+  it("classifies donotreply variants as notifications", () => {
+    expect(
+      classifyBucket({
+        from: "<donotreply@bank.example>",
+        label_ids: [],
+      }),
+    ).toBe("notifications");
+  });
+
+  it("classifies alerts@ as notifications", () => {
+    expect(
+      classifyBucket({
+        from: "GitHub <alerts@github.com>",
+        label_ids: ["INBOX"],
+      }),
+    ).toBe("notifications");
+  });
+
+  it("classifies newsletter@ as newsletter", () => {
+    expect(
+      classifyBucket({
+        from: "Acme <newsletter@acme.com>",
+        label_ids: ["INBOX"],
+      }),
+    ).toBe("newsletters");
+  });
+
+  it("classifies team@ as newsletter", () => {
+    expect(
+      classifyBucket({
+        from: "Some Team <team@example.com>",
+        label_ids: ["INBOX"],
+      }),
+    ).toBe("newsletters");
+  });
+
+  it("classifies a plain personal sender as personal", () => {
+    expect(
+      classifyBucket({
+        from: "Alice Smith <alice.smith@example.com>",
+        label_ids: ["INBOX", "CATEGORY_PERSONAL"],
+      }),
+    ).toBe("personal");
+  });
+
+  it("prefers CATEGORY_PROMOTIONS over noreply heuristic", () => {
+    // Even though sender looks like a notification, Gmail says it's a promo.
+    expect(
+      classifyBucket({
+        from: "<no-reply@store.com>",
+        label_ids: ["CATEGORY_PROMOTIONS"],
+      }),
+    ).toBe("newsletters");
+  });
+
+  it("does not match 'info' inside a longer word", () => {
+    // 'informationservices@' shouldn't match because we anchor on - / _.
+    expect(
+      classifyBucket({
+        from: "<informationservices@example.com>",
+        label_ids: [],
+      }),
+    ).toBe("personal");
+  });
+
+  it("matches xxx-news@ as newsletter", () => {
+    expect(
+      classifyBucket({
+        from: "<infoworld-news@example.com>",
+        label_ids: [],
+      }),
+    ).toBe("newsletters");
   });
 });
 

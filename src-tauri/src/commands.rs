@@ -422,13 +422,25 @@ fn folder_where_clause(folder: &str) -> &'static str {
         "inbox" => " AND label_ids LIKE '%\"INBOX\"%'",
         "pinned" => " AND label_ids LIKE '%\"STARRED\"%'",
         "sent" => " AND label_ids LIKE '%\"SENT\"%'",
+        "snoozed" => {
+            " AND EXISTS (
+                SELECT 1 FROM snoozes s
+                WHERE s.account_email = messages.account_email
+                  AND s.message_id = messages.id
+            )"
+        }
         "archive" => {
             " AND label_ids NOT LIKE '%\"INBOX\"%' \
               AND label_ids NOT LIKE '%\"SENT\"%' \
               AND label_ids NOT LIKE '%\"TRASH\"%' \
               AND label_ids NOT LIKE '%\"DRAFT\"%' \
               AND label_ids NOT LIKE '%\"SPAM\"%' \
-              AND label_ids NOT LIKE '%\"CHAT\"%'"
+              AND label_ids NOT LIKE '%\"CHAT\"%' \
+              AND NOT EXISTS (
+                SELECT 1 FROM snoozes s
+                WHERE s.account_email = messages.account_email
+                  AND s.message_id = messages.id
+              )"
         }
         "trash" => " AND label_ids LIKE '%\"TRASH\"%'",
         _ => "",
@@ -587,6 +599,68 @@ pub async fn get_message(
         }
     }
     Ok(detail)
+}
+
+#[tauri::command]
+pub async fn get_thread(
+    state: State<'_, AppState>,
+    email: String,
+    thread_id: String,
+) -> Result<Vec<MessageDetail>, String> {
+    let ids: Vec<String> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages
+                 WHERE account_email = ?1 AND thread_id = ?2
+                 ORDER BY date_millis ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![email, thread_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let cached: Option<MessageDetail> = {
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT detail_json FROM message_bodies
+                 WHERE account_email = ?1 AND id = ?2",
+                params![email, id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|j| serde_json::from_str::<MessageDetail>(&j).ok())
+        };
+        if let Some(d) = cached {
+            out.push(d);
+            continue;
+        }
+        match fetch_full_with_retry(&state, &email, &id).await {
+            Ok(detail) => {
+                if let Ok(json) = serde_json::to_string(&detail) {
+                    if let Ok(conn) = state.db.lock() {
+                        let _ = conn.execute(
+                            "INSERT OR REPLACE INTO message_bodies
+                             (account_email, id, detail_json, fetched_at)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![email, id, json, Utc::now().to_rfc3339()],
+                        );
+                    }
+                }
+                out.push(detail);
+            }
+            Err(e) => {
+                tracing::warn!(%email, %id, error = %format!("{e:#}"), "get_thread: skipping unfetchable message");
+            }
+        }
+    }
+    Ok(out)
 }
 
 async fn fetch_metadata_with_retry(
@@ -786,7 +860,7 @@ pub async fn untrash_message(
     Ok(())
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendRequest {
     pub from_account: String,
@@ -840,6 +914,356 @@ pub async fn send_message(
         tracing::error!(error = %format!("{e:#}"), "send_message failed");
         format!("{e:#}")
     })
+}
+
+#[tauri::command]
+pub async fn snooze_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    message_id: String,
+    fire_at_ms: i64,
+) -> Result<(), String> {
+    let labels = with_token(&state, &email, |http, token| {
+        let mid = message_id.clone();
+        Box::pin(async move {
+            gmail::messages::modify_labels(http, token, &mid, &[], &["INBOX"]).await
+        })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(%email, error = %format!("{e:#}"), "snooze: modify failed");
+        format!("{e:#}")
+    })?;
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO snoozes (account_email, message_id, fire_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![email, message_id, fire_at_ms],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    update_message_labels(&state.db, &email, &message_id, &labels)?;
+    let _ = app.emit("messages:changed", &message_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unsnooze_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    message_id: String,
+) -> Result<(), String> {
+    let labels = with_token(&state, &email, |http, token| {
+        let mid = message_id.clone();
+        Box::pin(async move {
+            gmail::messages::modify_labels(http, token, &mid, &["INBOX"], &[]).await
+        })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(%email, error = %format!("{e:#}"), "unsnooze: modify failed");
+        format!("{e:#}")
+    })?;
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM snoozes WHERE account_email = ?1 AND message_id = ?2",
+            params![email, message_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    update_message_labels(&state.db, &email, &message_id, &labels)?;
+    let _ = app.emit("messages:changed", &message_id);
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SnoozedRow {
+    pub message_id: String,
+    pub account_email: String,
+    pub fire_at_ms: i64,
+}
+
+#[tauri::command]
+pub fn list_snoozed(
+    state: State<'_, AppState>,
+    email: Option<String>,
+) -> Result<Vec<SnoozedRow>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let sql = match email.as_deref() {
+        Some(_) => "SELECT message_id, account_email, fire_at_ms FROM snoozes
+                    WHERE account_email = ?1 ORDER BY fire_at_ms ASC",
+        None => "SELECT message_id, account_email, fire_at_ms FROM snoozes
+                 ORDER BY fire_at_ms ASC",
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let map_row = |r: &rusqlite::Row| {
+        Ok(SnoozedRow {
+            message_id: r.get(0)?,
+            account_email: r.get(1)?,
+            fire_at_ms: r.get(2)?,
+        })
+    };
+    let rows: Vec<SnoozedRow> = if let Some(e) = email {
+        stmt.query_map(params![e], map_row)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect()
+    } else {
+        stmt.query_map([], map_row)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect()
+    };
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn mute_thread(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    thread_id: String,
+) -> Result<(), String> {
+    // Pull every cached message_id in the thread that still sits in Inbox.
+    let ids: Vec<String> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages
+                 WHERE account_email = ?1 AND thread_id = ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![email, thread_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // Record the mute first so concurrent sync hooks also apply it.
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO muted_threads (account_email, thread_id, muted_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![email, thread_id, Utc::now().timestamp_millis()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    for id in ids {
+        let labels = with_token(&state, &email, |http, token| {
+            let mid = id.clone();
+            Box::pin(async move {
+                gmail::messages::modify_labels(http, token, &mid, &[], &["INBOX"]).await
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(%email, %id, error = %format!("{e:#}"), "mute: archive failed");
+            format!("{e:#}")
+        })?;
+        update_message_labels(&state.db, &email, &id, &labels)?;
+    }
+    let _ = app.emit("messages:changed", &thread_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn unmute_thread(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    thread_id: String,
+) -> Result<(), String> {
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM muted_threads WHERE account_email = ?1 AND thread_id = ?2",
+            params![email, thread_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("messages:changed", &thread_id);
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleSendRequest {
+    pub fire_at_ms: i64,
+    #[serde(flatten)]
+    pub send: SendRequest,
+}
+
+#[tauri::command]
+pub async fn schedule_send(
+    state: State<'_, AppState>,
+    request: ScheduleSendRequest,
+) -> Result<String, String> {
+    let id = format!("sch_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let payload =
+        serde_json::to_string(&serde_json::json!(request.send)).map_err(|e| e.to_string())?;
+    let account_email = request.send.from_account.clone();
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO scheduled_sends
+             (id, account_email, payload_json, fire_at_ms, created_at, sent)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![
+                id,
+                account_email,
+                payload,
+                request.fire_at_ms,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(id)
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ScheduledRow {
+    pub id: String,
+    pub account_email: String,
+    pub fire_at_ms: i64,
+    pub subject: String,
+    pub to: String,
+}
+
+#[tauri::command]
+pub fn list_scheduled(state: State<'_, AppState>) -> Result<Vec<ScheduledRow>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, account_email, fire_at_ms, payload_json FROM scheduled_sends
+             WHERE sent = 0 ORDER BY fire_at_ms ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: String = r.get(0)?;
+            let account: String = r.get(1)?;
+            let fire: i64 = r.get(2)?;
+            let payload: String = r.get(3)?;
+            Ok((id, account, fire, payload))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows.flatten() {
+        let (id, account, fire, payload) = r;
+        let subject = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|v| v.get("subject").and_then(|s| s.as_str().map(String::from)))
+            .unwrap_or_default();
+        let to = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|v| {
+                v.get("to")
+                    .and_then(|arr| arr.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+            })
+            .unwrap_or_default();
+        out.push(ScheduledRow {
+            id,
+            account_email: account,
+            fire_at_ms: fire,
+            subject,
+            to,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn cancel_scheduled(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM scheduled_sends WHERE id = ?1 AND sent = 0",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Called from the timer task — runs the same logic as the user-initiated
+// unsnooze, but without an AppHandle for event emission and using anyhow
+// errors instead of String to play nice with the timer plumbing.
+pub async fn unsnooze_now(
+    state: &AppState,
+    email: &str,
+    message_id: &str,
+) -> anyhow::Result<()> {
+    let labels = with_token(state, email, |http, token| {
+        let mid = message_id.to_string();
+        Box::pin(
+            async move { gmail::messages::modify_labels(http, token, &mid, &["INBOX"], &[]).await },
+        )
+    })
+    .await?;
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+        conn.execute(
+            "DELETE FROM snoozes WHERE account_email = ?1 AND message_id = ?2",
+            params![email, message_id],
+        )?;
+    }
+    update_message_labels(&state.db, email, message_id, &labels)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+pub async fn fire_scheduled_send(
+    state: &AppState,
+    email: &str,
+    payload_json: &str,
+) -> anyhow::Result<()> {
+    let req: SendRequest = serde_json::from_str(payload_json)
+        .map_err(|e| anyhow::anyhow!("parse scheduled payload: {e}"))?;
+    let display_name = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+        conn.query_row(
+            "SELECT display_name FROM accounts WHERE email = ?1",
+            params![email],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+    let compose = Compose {
+        from: req.from_account.clone(),
+        from_name: display_name,
+        to: req.to,
+        cc: req.cc,
+        bcc: req.bcc,
+        subject: req.subject,
+        body: req.body,
+        in_reply_to: req.in_reply_to,
+        references: req.references,
+    };
+    let from = req.from_account.clone();
+    with_token(state, &from, |http, token| {
+        let c = compose.clone();
+        Box::pin(async move { gmail::compose::send(http, token, &c).await })
+    })
+    .await?;
+    Ok(())
 }
 
 fn update_message_labels(

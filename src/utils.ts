@@ -95,6 +95,11 @@ export function matchesFolder(labels: string[], folder: string): boolean {
       return has("SENT");
     case "trash":
       return has("TRASH");
+    case "snoozed":
+      // Snoozed-ness lives in a separate SQLite table, not in Gmail labels.
+      // Treat label-only mutations as in-place so the cache stays consistent;
+      // explicit (un)snooze actions trigger a reload separately.
+      return true;
     case "archive":
       return (
         !has("INBOX") &&
@@ -107,4 +112,77 @@ export function matchesFolder(labels: string[], folder: string): boolean {
     default:
       return true;
   }
+}
+
+export type Bucket = "personal" | "newsletters" | "notifications";
+
+const NOTIFICATION_LOCAL_PARTS = [
+  "no-reply",
+  "noreply",
+  "no_reply",
+  "donotreply",
+  "do-not-reply",
+  "do_not_reply",
+  "notification",
+  "notifications",
+  "alert",
+  "alerts",
+  "mailer-daemon",
+  "mailerdaemon",
+  "postmaster",
+  "bounce",
+  "bounces",
+  "automated",
+];
+
+const NEWSLETTER_LOCAL_PARTS = [
+  "newsletter",
+  "newsletters",
+  "news",
+  "digest",
+  "updates",
+  "marketing",
+  "promo",
+  "promotions",
+  "info",
+  "hello",
+  "hi",
+  "team",
+  "community",
+];
+
+function localPart(email: string): string {
+  const i = email.indexOf("@");
+  return (i >= 0 ? email.slice(0, i) : email).toLowerCase();
+}
+
+function matchesLocalPart(local: string, candidates: string[]): boolean {
+  for (const c of candidates) {
+    if (local === c) return true;
+    if (local.startsWith(`${c}-`) || local.startsWith(`${c}_`)) return true;
+    if (local.endsWith(`-${c}`) || local.endsWith(`_${c}`)) return true;
+  }
+  return false;
+}
+
+export function classifyBucket(m: {
+  from: string;
+  label_ids: string[];
+}): Bucket {
+  const labels = new Set(m.label_ids);
+  if (
+    labels.has("CATEGORY_PROMOTIONS") ||
+    labels.has("CATEGORY_UPDATES") ||
+    labels.has("CATEGORY_FORUMS")
+  ) {
+    return "newsletters";
+  }
+  if (labels.has("CATEGORY_SOCIAL")) {
+    return "notifications";
+  }
+  const email = parseFromHeader(m.from).email.toLowerCase();
+  const local = localPart(email);
+  if (matchesLocalPart(local, NOTIFICATION_LOCAL_PARTS)) return "notifications";
+  if (matchesLocalPart(local, NEWSLETTER_LOCAL_PARTS)) return "newsletters";
+  return "personal";
 }

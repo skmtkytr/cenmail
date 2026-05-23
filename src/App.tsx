@@ -12,17 +12,26 @@ import { createStore } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
+import {
   cacheKey,
+  classifyBucket,
   extractEmailAddresses,
   formatRelativeDate,
   matchesFolder,
   parseFromHeader,
   prefixSubject,
   type AccountSelection,
+  type Bucket,
 } from "./utils";
 import { sanitizeMessageHtml } from "./htmlSanitize";
-import { ToastContainer, showToast } from "./toast";
+import { ToastContainer, showToast, triggerLastAction } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
+import { settings, notificationsEnabledFor } from "./settings";
+import { SettingsModal } from "./settingsModal";
 import "./App.css";
 
 const DRAFT_STORAGE_KEY = "cenmail:compose-draft";
@@ -102,6 +111,7 @@ type Folder = { id: string; label: string };
 const folders: Folder[] = [
   { id: "inbox", label: "Inbox" },
   { id: "pinned", label: "Pinned" },
+  { id: "snoozed", label: "Snoozed" },
   { id: "sent", label: "Sent" },
   { id: "archive", label: "Archive" },
   { id: "trash", label: "Trash" },
@@ -141,10 +151,29 @@ function readStoredWidth(key: keyof typeof PANE_DEFAULTS): number {
 }
 
 function App() {
-  const prefersDark = usePrefersDark();
+  const osPrefersDark = usePrefersDark();
+  // The user can override the OS preference in settings.
+  const prefersDark = () => {
+    const theme = settings().appearance.theme;
+    if (theme === "dark") return true;
+    if (theme === "light") return false;
+    return osPrefersDark();
+  };
   const [allowImagesFor, setAllowImagesFor] = createSignal<Set<string>>(
     new Set(),
   );
+  const [settingsOpen, setSettingsOpen] = createSignal(false);
+
+  // Apply explicit theme override to <html data-theme=...>.
+  createEffect(() => {
+    const theme = settings().appearance.theme;
+    const root = document.documentElement;
+    if (theme === "system") {
+      root.removeAttribute("data-theme");
+    } else {
+      root.setAttribute("data-theme", theme);
+    }
+  });
   const [selectedFolder, setSelectedFolder] = createSignal("inbox");
   const [selectedAccount, setSelectedAccount] =
     createSignal<AccountSelection>("all");
@@ -213,7 +242,7 @@ function App() {
   }
 
   function handleListClick(e: MouseEvent, message: MessageMeta) {
-    const list = messages() ?? [];
+    const list = visibleMessages() ?? [];
     if (e.shiftKey && anchorId()) {
       e.preventDefault();
       const i = list.findIndex((m) => m.id === anchorId());
@@ -354,6 +383,23 @@ function App() {
     cacheKey(selectedAccount(), selectedFolder(), debouncedSearch()) in
     messageCache;
 
+  // Smart Inbox bucket filter — only applies to the Inbox folder.
+  const [selectedBucket, setSelectedBucket] = createSignal<Bucket | "all">(
+    settings().inbox.defaultBucket,
+  );
+  const bucketCounts = createMemo(() => {
+    const out = { personal: 0, newsletters: 0, notifications: 0 };
+    if (selectedFolder() !== "inbox") return out;
+    for (const m of messages()) out[classifyBucket(m)] += 1;
+    return out;
+  });
+  const visibleMessages = createMemo(() => {
+    const all = messages();
+    const bucket = selectedBucket();
+    if (bucket === "all" || selectedFolder() !== "inbox") return all;
+    return all.filter((m) => classifyBucket(m) === bucket);
+  });
+
   const [sidebarWidth, setSidebarWidth] = createSignal(
     readStoredWidth("sidebar"),
   );
@@ -453,11 +499,107 @@ function App() {
         setSyncState(email, "error", error);
       }),
     );
+    unlistenFns.push(
+      await listen<string>("snooze:fired", () => {
+        reloadAllVisible();
+      }),
+    );
+    unlistenFns.push(
+      await listen<string>("schedule:sent", () => {
+        showToast({ message: "Scheduled message sent" });
+      }),
+    );
+    unlistenFns.push(
+      await listen<string>("messages:changed", () => {
+        // Backend mutated a message (e.g., timer fired); refresh visible list.
+        reloadAllVisible();
+      }),
+    );
 
     // Backfill profile pictures for accounts saved before picture_url existed.
     void backfillAccountProfiles();
+    // Ensure notification permission is requested early; ignore failure.
+    void ensureNotificationPermission();
     // Start background sync of all accounts on first load.
     void syncAll();
+  });
+
+  async function ensureNotificationPermission(): Promise<boolean> {
+    try {
+      let granted = await isPermissionGranted();
+      if (!granted) {
+        const perm = await requestPermission();
+        granted = perm === "granted";
+      }
+      return granted;
+    } catch {
+      return false;
+    }
+  }
+
+  const NOTIFY_KEY = "cenmail:last-notified-ms";
+  function getLastNotifiedMs(): number {
+    try {
+      const raw = localStorage.getItem(NOTIFY_KEY);
+      const n = raw ? parseInt(raw, 10) : 0;
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+  function setLastNotifiedMs(ms: number) {
+    try {
+      localStorage.setItem(NOTIFY_KEY, String(ms));
+    } catch {}
+  }
+
+  // Cross-reference: after a sync settles and the visible cache is reloaded,
+  // notify for any new Personal-bucket unread message we haven't notified for.
+  let notifyWarmedUp = false;
+  createEffect(() => {
+    const allKeys = Object.keys(messageCache);
+    if (allKeys.length === 0) return;
+    const lastSeen = getLastNotifiedMs();
+    let maxSeen = lastSeen;
+    const candidates: MessageMeta[] = [];
+    for (const key of allKeys) {
+      // Only consider the Inbox caches so we don't pick up sent/archive lists.
+      if (!key.startsWith("inbox:")) continue;
+      const list = messageCache[key] ?? [];
+      for (const m of list) {
+        if (m.date_millis > maxSeen) maxSeen = m.date_millis;
+        if (!m.unread) continue;
+        if (m.date_millis <= lastSeen) continue;
+        if (!notificationsEnabledFor(m.account_email, classifyBucket(m))) {
+          continue;
+        }
+        candidates.push(m);
+      }
+    }
+    // On first observation after launch, swallow the burst — set the watermark
+    // to the latest seen and don't fire any notifications.
+    if (!notifyWarmedUp) {
+      notifyWarmedUp = true;
+      if (maxSeen > lastSeen) setLastNotifiedMs(maxSeen);
+      return;
+    }
+    if (candidates.length === 0) return;
+    if (maxSeen > lastSeen) setLastNotifiedMs(maxSeen);
+    void ensureNotificationPermission().then((granted) => {
+      if (!granted) return;
+      if (candidates.length === 1) {
+        const m = candidates[0];
+        sendNotification({
+          title: parseFromHeader(m.from).name,
+          body: m.subject || "(no subject)",
+        });
+      } else {
+        sendNotification({
+          title: "cenmail",
+          body: `${candidates.length} new messages`,
+        });
+      }
+    });
   });
 
   async function backfillAccountProfiles() {
@@ -589,6 +731,101 @@ function App() {
     });
   }
 
+  function snoozePresets(): Array<{ label: string; fireAt: number }> {
+    const now = new Date();
+    const inOneHour = now.getTime() + 60 * 60 * 1000;
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(9, 0, 0, 0);
+    const nextMonday = new Date(now);
+    const daysUntilMonday = ((1 + 7 - nextMonday.getDay()) % 7) || 7;
+    nextMonday.setDate(nextMonday.getDate() + daysUntilMonday);
+    nextMonday.setHours(9, 0, 0, 0);
+    const thisEvening = new Date(now);
+    thisEvening.setHours(18, 0, 0, 0);
+    return [
+      { label: "1 hour", fireAt: inOneHour },
+      ...(thisEvening.getTime() > now.getTime() + 30 * 60 * 1000
+        ? [{ label: "This evening (6pm)", fireAt: thisEvening.getTime() }]
+        : []),
+      { label: "Tomorrow 9am", fireAt: tomorrow.getTime() },
+      { label: "Next Monday 9am", fireAt: nextMonday.getTime() },
+    ];
+  }
+
+  async function snoozeMessages(targets: MessageMeta[], fireAtMs: number) {
+    if (targets.length === 0) return;
+    for (const t of targets) {
+      // Optimistic: remove from current cache so it disappears immediately.
+      applyLocalLabelChange(t, [], ["INBOX"]);
+      try {
+        await invoke("snooze_message", {
+          email: t.account_email,
+          messageId: t.id,
+          fireAtMs,
+        });
+      } catch (err) {
+        showToast({
+          message: `Snooze failed: ${err}`,
+          variant: "error",
+        });
+        reloadAllVisible();
+        return;
+      }
+    }
+    const when = new Date(fireAtMs);
+    const label =
+      targets.length === 1
+        ? `Snoozed until ${when.toLocaleString()}`
+        : `Snoozed ${targets.length} until ${when.toLocaleString()}`;
+    const snapshot = targets.slice();
+    showToast({
+      message: label,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          for (const t of snapshot) {
+            void invoke("unsnooze_message", {
+              email: t.account_email,
+              messageId: t.id,
+            }).catch((e) =>
+              showToast({ message: `Undo failed: ${e}`, variant: "error" }),
+            );
+          }
+          reloadAllVisible();
+        },
+      },
+    });
+  }
+
+  async function muteThreadAction(message: MessageMeta) {
+    if (!message.thread_id) {
+      showToast({ message: "No thread to mute", variant: "error" });
+      return;
+    }
+    try {
+      await invoke("mute_thread", {
+        email: message.account_email,
+        threadId: message.thread_id,
+      });
+      reloadAllVisible();
+      showToast({
+        message: "Thread muted",
+        action: {
+          label: "Undo",
+          onClick: () => {
+            void invoke("unmute_thread", {
+              email: message.account_email,
+              threadId: message.thread_id,
+            }).then(() => reloadAllVisible());
+          },
+        },
+      });
+    } catch (err) {
+      showToast({ message: `Mute failed: ${err}`, variant: "error" });
+    }
+  }
+
   function starToggleWithUndo(targets: MessageMeta[]) {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
@@ -670,7 +907,7 @@ function App() {
     setMessageDetail(null);
     setMessageDetailError(null);
     setMessageDetailLoading(true);
-    if (message.unread) {
+    if (message.unread && settings().inbox.markAsReadOnOpen) {
       void modifyLabels(message, [], ["UNREAD"]);
     }
     try {
@@ -679,6 +916,7 @@ function App() {
         messageId: message.id,
       });
       setMessageDetail(detail);
+      void loadThread(detail, message.account_email);
     } catch (err) {
       setMessageDetailError(String(err));
     } finally {
@@ -686,9 +924,89 @@ function App() {
     }
   }
 
+  const [threadDetails, setThreadDetails] = createSignal<MessageDetail[]>([]);
+  const [expandedInThread, setExpandedInThread] = createSignal<Set<string>>(
+    new Set<string>(),
+  );
+
+  async function loadThread(detail: MessageDetail, accountEmail: string) {
+    if (!detail.thread_id) {
+      setThreadDetails([detail]);
+      setExpandedInThread(new Set([detail.id]));
+      return;
+    }
+    try {
+      const result = await invoke<MessageDetail[]>("get_thread", {
+        email: accountEmail,
+        threadId: detail.thread_id,
+      });
+      if (result.length <= 1) {
+        setThreadDetails([detail]);
+        setExpandedInThread(new Set([detail.id]));
+        return;
+      }
+      setThreadDetails(result);
+      // Expand the latest, plus the message the user clicked on.
+      const last = result[result.length - 1];
+      const expanded = new Set<string>([last.id, detail.id]);
+      setExpandedInThread(expanded);
+    } catch {
+      setThreadDetails([detail]);
+      setExpandedInThread(new Set([detail.id]));
+    }
+  }
+
+  function toggleThreadExpanded(id: string) {
+    const next = new Set(expandedInThread());
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setExpandedInThread(next);
+  }
+
+  function latestInThread(): MessageDetail | null {
+    const arr = threadDetails();
+    return arr.length > 0 ? arr[arr.length - 1] : null;
+  }
+
   const [compose, setCompose] = createSignal<ComposeState | null>(null);
-  const [sending, setSending] = createSignal(false);
   const [sendError, setSendError] = createSignal<string | null>(null);
+  const [scheduleMenuOpen, setScheduleMenuOpen] = createSignal(false);
+
+  async function scheduleCurrentCompose(fireAtMs: number) {
+    const cur = compose();
+    if (!cur) return;
+    if (!cur.from_account) {
+      setSendError("Choose an account to send from.");
+      return;
+    }
+    const to = extractEmailAddresses(cur.to);
+    if (to.length === 0) {
+      setSendError("Add at least one recipient in To.");
+      return;
+    }
+    try {
+      await invoke("schedule_send", {
+        request: {
+          fireAtMs,
+          fromAccount: cur.from_account,
+          to,
+          cc: extractEmailAddresses(cur.cc),
+          bcc: extractEmailAddresses(cur.bcc),
+          subject: cur.subject,
+          body: cur.body,
+          inReplyTo: cur.in_reply_to,
+          references: cur.references,
+        },
+      });
+      clearDraft();
+      setCompose(null);
+      showToast({
+        message: `Scheduled for ${new Date(fireAtMs).toLocaleString()}`,
+      });
+    } catch (err) {
+      setSendError(String(err));
+    }
+  }
 
   // Autosave: only persist blank composes (reply / forward composes are
   // initiated from a specific message and shouldn't survive across sessions).
@@ -702,11 +1020,18 @@ function App() {
   });
 
   function defaultFromAccount(): string {
+    // 1. Explicit user default in settings wins (if still valid).
+    const explicit = settings().compose.defaultAccount;
+    if (explicit && (accounts() ?? []).some((a) => a.email === explicit)) {
+      return explicit;
+    }
+    // 2. Current sidebar selection if narrowed to one account.
     const sel = selectedAccount();
     if (sel !== "all") {
       const acct = accountById(sel);
       if (acct) return acct.email;
     }
+    // 3. First added.
     return (accounts() ?? [])[0]?.email ?? "";
   }
 
@@ -765,7 +1090,7 @@ function App() {
   }
 
   function openReply(all: boolean) {
-    const detail = messageDetail();
+    const detail = latestInThread() ?? messageDetail();
     if (!detail) return;
     const senderMeta = (messages() ?? []).find(
       (m) => m.id === selectedMessageId(),
@@ -802,7 +1127,7 @@ function App() {
   }
 
   function openForward() {
-    const detail = messageDetail();
+    const detail = latestInThread() ?? messageDetail();
     if (!detail) return;
     const senderMeta = (messages() ?? []).find(
       (m) => m.id === selectedMessageId(),
@@ -823,7 +1148,6 @@ function App() {
   }
 
   async function closeCompose() {
-    if (sending()) return;
     const cur = compose();
     if (cur && !isComposeEmpty(cur)) {
       const ok = await confirmModal({
@@ -847,6 +1171,28 @@ function App() {
     setCompose({ ...cur, [key]: value });
   }
 
+  let pendingSendTimer: number | undefined;
+  let pendingSendPayload: ComposeState | null = null;
+
+  function fireSend(payload: ComposeState) {
+    invoke("send_message", {
+      request: {
+        fromAccount: payload.from_account,
+        to: extractEmailAddresses(payload.to),
+        cc: extractEmailAddresses(payload.cc),
+        bcc: extractEmailAddresses(payload.bcc),
+        subject: payload.subject,
+        body: payload.body,
+        inReplyTo: payload.in_reply_to,
+        references: payload.references,
+      },
+    })
+      .then(() => showToast({ message: "Sent" }))
+      .catch((err) =>
+        showToast({ message: `Send failed: ${err}`, variant: "error" }),
+      );
+  }
+
   async function handleSendCompose() {
     const cur = compose();
     if (!cur) return;
@@ -860,28 +1206,50 @@ function App() {
       return;
     }
     setSendError(null);
-    setSending(true);
-    try {
-      await invoke("send_message", {
-        request: {
-          fromAccount: cur.from_account,
-          to,
-          cc: extractEmailAddresses(cur.cc),
-          bcc: extractEmailAddresses(cur.bcc),
-          subject: cur.subject,
-          body: cur.body,
-          inReplyTo: cur.in_reply_to,
-          references: cur.references,
-        },
-      });
-      clearDraft();
-      setCompose(null);
-      showToast({ message: "Sent" });
-    } catch (err) {
-      setSendError(String(err));
-    } finally {
-      setSending(false);
+
+    // If an earlier send is still in its undo window, fire it now so we don't
+    // lose it when this one queues up.
+    if (pendingSendTimer !== undefined && pendingSendPayload) {
+      window.clearTimeout(pendingSendTimer);
+      const earlier = pendingSendPayload;
+      pendingSendTimer = undefined;
+      pendingSendPayload = null;
+      fireSend(earlier);
     }
+
+    const payload: ComposeState = { ...cur };
+    pendingSendPayload = payload;
+    clearDraft();
+    setCompose(null);
+
+    const undoMs = Math.max(0, settings().compose.undoSendSeconds) * 1000;
+    if (undoMs === 0) {
+      pendingSendPayload = null;
+      fireSend(payload);
+      return;
+    }
+
+    pendingSendTimer = window.setTimeout(() => {
+      pendingSendTimer = undefined;
+      pendingSendPayload = null;
+      fireSend(payload);
+    }, undoMs);
+
+    showToast({
+      message: "Sending…",
+      timeoutMs: undoMs + 500,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          if (pendingSendTimer !== undefined) {
+            window.clearTimeout(pendingSendTimer);
+            pendingSendTimer = undefined;
+          }
+          pendingSendPayload = null;
+          setCompose(payload);
+        },
+      },
+    });
   }
 
   const [contextMenu, setContextMenu] = createSignal<{
@@ -908,7 +1276,7 @@ function App() {
   }
 
   function moveSelection(delta: number) {
-    const list = messages() ?? [];
+    const list = visibleMessages() ?? [];
     if (list.length === 0) return;
     const id = selectedMessageId();
     const idx = id ? list.findIndex((m) => m.id === id) : -1;
@@ -966,10 +1334,24 @@ function App() {
 
     if (isEditableTarget(e.target)) return;
 
+    // Ctrl/Cmd+Z fires the most recent undoable toast (archive, snooze, etc.).
+    // Placed after the editable-target bail so native text undo in compose
+    // still works.
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      !e.shiftKey &&
+      e.key.toLowerCase() === "z"
+    ) {
+      if (triggerLastAction()) {
+        e.preventDefault();
+      }
+      return;
+    }
+
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
       if (compose() || showShortcuts()) return;
       e.preventDefault();
-      const list = messages() ?? [];
+      const list = visibleMessages() ?? [];
       setSelectedIds(new Set(list.map((m) => m.id)));
       if (list.length > 0) setAnchorId(list[0].id);
       return;
@@ -1013,6 +1395,21 @@ function App() {
         if (targets.length > 0) {
           e.preventDefault();
           starToggleWithUndo(targets);
+        }
+        break;
+      }
+      case "z": {
+        const targets = bulk();
+        if (targets.length > 0) {
+          e.preventDefault();
+          void snoozeMessages(targets, snoozePresets()[0].fireAt);
+        }
+        break;
+      }
+      case "m": {
+        if (m) {
+          e.preventDefault();
+          void muteThreadAction(m);
         }
         break;
       }
@@ -1100,15 +1497,26 @@ function App() {
       >
         <div class="flex items-center justify-between px-4 py-3">
           <span class="text-sm font-semibold tracking-wide">cenmail</span>
-          <button
-            type="button"
-            onClick={handleRefresh}
-            title="Sync now"
-            class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
-            aria-label="Sync now"
-          >
-            ↻
-          </button>
+          <div class="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              title="Settings"
+              class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
+              aria-label="Settings"
+            >
+              ⚙
+            </button>
+            <button
+              type="button"
+              onClick={handleRefresh}
+              title="Sync now"
+              class="rounded p-1 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
+              aria-label="Sync now"
+            >
+              ↻
+            </button>
+          </div>
         </div>
         <div class="px-2 pb-2">
           <button
@@ -1260,8 +1668,8 @@ function App() {
           <div class="flex shrink-0 items-center gap-2 text-xs text-[color:var(--color-muted)]">
             <span>
               {messagesLoading()
-                ? `${messages().length} ↻`
-                : `${messages().length.toLocaleString()} messages`}
+                ? `${visibleMessages().length} ↻`
+                : `${visibleMessages().length.toLocaleString()} messages`}
             </span>
             <button
               type="button"
@@ -1311,9 +1719,59 @@ function App() {
             {messagesError()}
           </div>
         </Show>
+        <Show when={selectedFolder() === "inbox"}>
+          <div class="flex shrink-0 gap-1 border-b border-[color:var(--color-border)] px-3 py-1.5 text-xs">
+            <For
+              each={
+                [
+                  { id: "all" as const, label: "All", count: null },
+                  {
+                    id: "personal" as const,
+                    label: "Personal",
+                    count: bucketCounts().personal,
+                  },
+                  {
+                    id: "newsletters" as const,
+                    label: "Newsletters",
+                    count: bucketCounts().newsletters,
+                  },
+                  {
+                    id: "notifications" as const,
+                    label: "Notifications",
+                    count: bucketCounts().notifications,
+                  },
+                ]
+              }
+            >
+              {(b) => {
+                const active = () => selectedBucket() === b.id;
+                return (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedBucket(b.id)}
+                    class={`flex items-center gap-1.5 rounded-full px-2.5 py-1 ${
+                      active()
+                        ? "bg-[color:var(--color-accent-bg)] text-[color:var(--color-fg)] font-medium"
+                        : "text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)]"
+                    }`}
+                  >
+                    <span>{b.label}</span>
+                    <Show when={b.count !== null && b.count > 0}>
+                      <span class="text-[color:var(--color-muted)]">
+                        {b.count}
+                      </span>
+                    </Show>
+                  </button>
+                );
+              }}
+            </For>
+          </div>
+        </Show>
         <ul class="flex-1 overflow-y-auto">
           <Show
-            when={!messagesLoading() && hasCache() && messages().length === 0}
+            when={
+              !messagesLoading() && hasCache() && visibleMessages().length === 0
+            }
           >
             <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
               {(accounts() ?? []).length === 0
@@ -1328,7 +1786,7 @@ function App() {
               Loading…
             </li>
           </Show>
-          <For each={messages()}>
+          <For each={visibleMessages()}>
             {(m) => {
               const active = () => selectedMessageId() === m.id;
               const fromParsed = () => parseFromHeader(m.from);
@@ -1462,117 +1920,167 @@ function App() {
             </div>
           }
         >
-          <Show when={messageDetailLoading()}>
-            <div class="p-8 text-sm text-[color:var(--color-muted)]">
+          <Show when={messageDetailLoading() && threadDetails().length === 0}>
+            <div class="flex flex-1 items-center justify-center text-sm text-[color:var(--color-muted)]">
               Loading…
             </div>
           </Show>
-          <Show when={messageDetailError()}>
-            <div class="m-6 rounded border border-red-400 bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
-              {messageDetailError()}
+          <Show when={messageDetailError() && threadDetails().length === 0}>
+            <div class="flex flex-1 items-center justify-center p-6">
+              <div class="rounded border border-red-400 bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+                {messageDetailError()}
+              </div>
             </div>
           </Show>
-          <Show when={messageDetail()}>
-            {(detail) => (
-              <>
-                <header class="border-b border-[color:var(--color-border)] px-6 py-4">
-                  <div class="flex items-start justify-between gap-4">
-                    <h1 class="text-lg font-semibold">
-                      {detail().subject || "(no subject)"}
-                    </h1>
-                    <div class="flex shrink-0 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => openReply(false)}
-                        class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                      >
-                        Reply
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => openReply(true)}
-                        class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                      >
-                        Reply all
-                      </button>
-                      <button
-                        type="button"
-                        onClick={openForward}
-                        class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                      >
-                        Forward
-                      </button>
-                    </div>
-                  </div>
-                  <div class="mt-1 text-sm text-[color:var(--color-muted)]">
-                    <span class="font-medium text-[color:var(--color-fg)]">
-                      {parseFromHeader(detail().from).name}
-                    </span>{" "}
-                    &lt;{parseFromHeader(detail().from).email}&gt;
-                  </div>
-                  <div class="text-xs text-[color:var(--color-muted)]">
-                    {detail().date}
-                  </div>
-                </header>
-                <div class="flex flex-1 flex-col overflow-hidden">
-                  <Show
-                    when={detail().html_body}
-                    fallback={
-                      <pre class="h-full overflow-auto whitespace-pre-wrap p-6 font-sans text-sm">
-                        {detail().text_body || "(no body)"}
-                      </pre>
-                    }
+          <Show when={messageDetail() && threadDetails().length > 0}>
+            <header class="shrink-0 border-b border-[color:var(--color-border)] px-6 py-4">
+              <div class="flex items-start justify-between gap-4">
+                <h1 class="text-lg font-semibold">
+                  {(latestInThread() ?? messageDetail())?.subject ||
+                    "(no subject)"}
+                </h1>
+                <div class="flex shrink-0 items-center gap-2">
+                  <Show when={threadDetails().length > 1}>
+                    <span class="rounded-full bg-[color:var(--color-surface-active)] px-2 py-0.5 text-xs text-[color:var(--color-muted)]">
+                      {threadDetails().length} messages
+                    </span>
+                  </Show>
+                  <button
+                    type="button"
+                    onClick={() => openReply(false)}
+                    class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
                   >
-                    {(() => {
-                      const id = detail().id;
-                      const allowed = () => allowImagesFor().has(id);
-                      const sanitized = createMemo(() =>
-                        sanitizeMessageHtml(detail().html_body ?? "", {
-                          allowRemoteImages: allowed(),
-                          dark: prefersDark(),
-                        }),
-                      );
-                      return (
-                        <>
-                          <Show
-                            when={
-                              !allowed() && sanitized().blockedImages > 0
-                            }
-                          >
-                            <div class="flex items-center justify-between border-b border-[color:var(--color-border)] bg-[color:var(--color-bg)] px-6 py-2 text-xs text-[color:var(--color-muted)]">
-                              <span>
-                                Remote images blocked to protect your privacy.
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const next = new Set(allowImagesFor());
-                                  next.add(id);
-                                  setAllowImagesFor(next);
-                                }}
-                                class="rounded border border-[color:var(--color-border)] px-2 py-0.5 text-xs hover:bg-[color:var(--color-surface-hover)]"
-                              >
-                                Show images
-                              </button>
+                    Reply
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openReply(true)}
+                    class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
+                  >
+                    Reply all
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openForward}
+                    class="rounded border border-[color:var(--color-border)] px-3 py-1 text-xs hover:bg-[color:var(--color-surface-hover)]"
+                  >
+                    Forward
+                  </button>
+                </div>
+              </div>
+            </header>
+            <div class="flex min-h-0 flex-1 flex-col overflow-y-auto">
+              <For each={threadDetails()}>
+                {(d, i) => {
+                  const expanded = () => expandedInThread().has(d.id);
+                  const allowed = () =>
+                    settings().privacy.alwaysAllowImages ||
+                    allowImagesFor().has(d.id);
+                  const sanitized = createMemo(() =>
+                    sanitizeMessageHtml(d.html_body ?? "", {
+                      allowRemoteImages: allowed(),
+                      dark: prefersDark(),
+                    }),
+                  );
+                  const isLast = () => i() === threadDetails().length - 1;
+                  const fillsRemaining = () => expanded() && isLast();
+                  return (
+                    <article
+                      class={`flex flex-col border-b border-[color:var(--color-border)] ${
+                        fillsRemaining() ? "min-h-0 flex-1" : "shrink-0"
+                      }`}
+                    >
+                      <header
+                        onClick={() => toggleThreadExpanded(d.id)}
+                        class="flex shrink-0 cursor-pointer items-baseline justify-between gap-4 px-6 py-3 hover:bg-[color:var(--color-surface-hover)]"
+                      >
+                        <div class="min-w-0 flex-1">
+                          <div class="truncate text-sm">
+                            <span class="font-medium">
+                              {parseFromHeader(d.from).name}
+                            </span>{" "}
+                            <span class="text-[color:var(--color-muted)]">
+                              &lt;{parseFromHeader(d.from).email}&gt;
+                            </span>
+                          </div>
+                          <Show when={!expanded()}>
+                            <div class="truncate text-xs text-[color:var(--color-muted)]">
+                              {(d.text_body ?? d.html_body ?? "")
+                                .replace(/<[^>]+>/g, " ")
+                                .replace(/\s+/g, " ")
+                                .slice(0, 160)}
                             </div>
                           </Show>
-                          <iframe
-                            srcdoc={sanitized().html}
-                            sandbox="allow-popups allow-popups-to-escape-sandbox"
-                            class={`h-full w-full flex-1 border-0 ${
-                              prefersDark()
-                                ? "bg-[color:var(--color-surface)]"
-                                : "bg-white"
-                            }`}
-                            title="message body"
-                          />
-                        </>
-                      );
-                    })()}
-                  </Show>
-                </div>
-              </>
-            )}
+                        </div>
+                        <span class="shrink-0 text-xs text-[color:var(--color-muted)]">
+                          {d.date}
+                        </span>
+                      </header>
+                      <Show when={expanded()}>
+                        <div
+                          class={`flex flex-col border-t border-[color:var(--color-border)] ${
+                            fillsRemaining() ? "min-h-0 flex-1" : ""
+                          }`}
+                        >
+                          <Show
+                            when={d.html_body}
+                            fallback={
+                              <pre
+                                class={`whitespace-pre-wrap p-6 font-sans text-sm ${
+                                  fillsRemaining()
+                                    ? "min-h-0 flex-1 overflow-auto"
+                                    : "max-h-[60vh] overflow-auto"
+                                }`}
+                              >
+                                {d.text_body || "(no body)"}
+                              </pre>
+                            }
+                          >
+                            <Show
+                              when={
+                                !allowed() && sanitized().blockedImages > 0
+                              }
+                            >
+                              <div class="flex shrink-0 items-center justify-between bg-[color:var(--color-bg)] px-6 py-2 text-xs text-[color:var(--color-muted)]">
+                                <span>
+                                  Remote images blocked to protect your
+                                  privacy.
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const next = new Set(allowImagesFor());
+                                    next.add(d.id);
+                                    setAllowImagesFor(next);
+                                  }}
+                                  class="rounded border border-[color:var(--color-border)] px-2 py-0.5 text-xs hover:bg-[color:var(--color-surface-hover)]"
+                                >
+                                  Show images
+                                </button>
+                              </div>
+                            </Show>
+                            <iframe
+                              srcdoc={sanitized().html}
+                              sandbox="allow-popups allow-popups-to-escape-sandbox"
+                              class={`w-full border-0 ${
+                                fillsRemaining()
+                                  ? "min-h-0 flex-1"
+                                  : "h-[60vh]"
+                              } ${
+                                prefersDark()
+                                  ? "bg-[color:var(--color-surface)]"
+                                  : "bg-white"
+                              }`}
+                              title="message body"
+                            />
+                          </Show>
+                        </div>
+                      </Show>
+                    </article>
+                  );
+                }}
+              </For>
+            </div>
           </Show>
         </Show>
       </section>
@@ -1629,6 +2137,37 @@ function App() {
                     }}
                   >
                     Archive
+                  </button>
+                </li>
+                <li class="border-t border-[color:var(--color-border)] mt-1 pt-1">
+                  <div class="px-3 pb-1 text-xs text-[color:var(--color-muted)]">
+                    Snooze until
+                  </div>
+                  <For each={snoozePresets()}>
+                    {(p) => (
+                      <button
+                        type="button"
+                        class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
+                        onClick={() => {
+                          closeContextMenu();
+                          void snoozeMessages([m], p.fireAt);
+                        }}
+                      >
+                        {p.label}
+                      </button>
+                    )}
+                  </For>
+                </li>
+                <li class="border-t border-[color:var(--color-border)] mt-1">
+                  <button
+                    type="button"
+                    class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
+                    onClick={() => {
+                      closeContextMenu();
+                      void muteThreadAction(m);
+                    }}
+                  >
+                    Mute thread
                   </button>
                 </li>
               </Show>
@@ -1719,6 +2258,34 @@ function App() {
                     </kbd>
                   </td>
                   <td>Toggle star</td>
+                </tr>
+                <tr>
+                  <td class="py-1 pr-4">
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      z
+                    </kbd>
+                  </td>
+                  <td>Snooze 1h</td>
+                </tr>
+                <tr>
+                  <td class="py-1 pr-4 whitespace-nowrap">
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      Ctrl
+                    </kbd>{" "}
+                    +{" "}
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      Z
+                    </kbd>
+                  </td>
+                  <td>Undo last action</td>
+                </tr>
+                <tr>
+                  <td class="py-1 pr-4">
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      m
+                    </kbd>
+                  </td>
+                  <td>Mute thread</td>
                 </tr>
                 <tr>
                   <td class="py-1 pr-4">
@@ -1929,21 +2496,50 @@ function App() {
               </Show>
 
               <footer class="flex items-center justify-end gap-2 border-t border-[color:var(--color-border)] px-4 py-3">
+                <div class="relative mr-auto">
+                  <button
+                    type="button"
+                    onClick={() => setScheduleMenuOpen(!scheduleMenuOpen())}
+                    class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]"
+                  >
+                    Send later ▾
+                  </button>
+                  <Show when={scheduleMenuOpen()}>
+                    <ul
+                      class="absolute bottom-full left-0 mb-1 min-w-44 rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] py-1 text-sm shadow-lg"
+                    >
+                      <For each={snoozePresets()}>
+                        {(p) => (
+                          <li>
+                            <button
+                              type="button"
+                              class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
+                              onClick={() => {
+                                setScheduleMenuOpen(false);
+                                void scheduleCurrentCompose(p.fireAt);
+                              }}
+                            >
+                              {p.label}
+                            </button>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+                </div>
                 <button
                   type="button"
                   onClick={closeCompose}
-                  disabled={sending()}
-                  class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)] disabled:opacity-50"
+                  class="rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
                   onClick={handleSendCompose}
-                  disabled={sending()}
-                  class="rounded bg-[color:var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
+                  class="rounded bg-[color:var(--color-accent)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90"
                 >
-                  {sending() ? "Sending…" : "Send"}
+                  Send
                 </button>
               </footer>
             </div>
@@ -1953,6 +2549,11 @@ function App() {
 
       <ToastContainer />
       <ConfirmHost />
+      <SettingsModal
+        open={settingsOpen()}
+        onClose={() => setSettingsOpen(false)}
+        accounts={accounts() ?? []}
+      />
     </div>
   );
 }
