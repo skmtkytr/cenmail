@@ -18,7 +18,21 @@ pub fn run() {
         .unwrap_or_else(|_| "cenmail=info,warn".parse().unwrap());
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let oauth_config = config::OAuthConfig::from_env().expect("load OAuth config from env");
+    let oauth_config = match config::OAuthConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            // Write a launch-time error so desktop-menu launches that crash
+            // before any UI appears still leave a breadcrumb the user can find.
+            let msg = format!("OAuth config error: {e:#}\n");
+            eprintln!("{msg}");
+            if let Some(dir) = dirs::data_local_dir() {
+                let log_dir = dir.join("cenmail");
+                let _ = std::fs::create_dir_all(&log_dir);
+                let _ = std::fs::write(log_dir.join("launch_error.log"), &msg);
+            }
+            std::process::exit(2);
+        }
+    };
     let conn = db::open().expect("init sqlite database");
 
     let http = reqwest::Client::builder()
