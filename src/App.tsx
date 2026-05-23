@@ -1070,6 +1070,8 @@ function App() {
           references: cur.references,
         },
       });
+      cancelPendingDraftSave();
+      bumpComposeSession();
       clearDraft();
       setCompose(null);
       showToast({
@@ -1083,12 +1085,18 @@ function App() {
   // Local autosave: keep the current compose around in localStorage so a
   // crash / window close restores it. Server-side autosave below handles
   // cross-device persistence via Gmail Drafts.
+  //
+  // Attachments are deliberately excluded: their base64 bytes can be tens
+  // of MB and localStorage caps at ~5–10 MB in WebKit. Serializing them on
+  // every keystroke would silently exceed quota; the user re-picks files
+  // after a crash, but the text/HTML body is preserved.
   createEffect(() => {
     const cur = compose();
     if (!cur) return;
     if (cur.in_reply_to || cur.subject.startsWith("Fwd:")) return;
+    const persistable: ComposeState = { ...cur, attachments: [] };
     try {
-      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(cur));
+      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(persistable));
     } catch {}
   });
 
@@ -1098,6 +1106,17 @@ function App() {
   // update in place.
   let draftSaveTimer: number | undefined;
   let draftSaveInflight = false;
+  let draftSaveErrorShown = false;
+  // Bumped every time the user switches to a different compose (open new,
+  // discard, schedule, finish sending). Captured by saveDraftNow before the
+  // network round-trip so we can detect "the compose changed while my save
+  // was in flight" — without this the returned draft_id can leak into a
+  // sibling compose and silently overwrite an unrelated server draft.
+  let composeSession = 0;
+  function bumpComposeSession() {
+    composeSession += 1;
+  }
+
   function scheduleDraftSave() {
     if (draftSaveTimer !== undefined) clearTimeout(draftSaveTimer);
     draftSaveTimer = window.setTimeout(saveDraftNow, 1500);
@@ -1113,6 +1132,8 @@ function App() {
     }
     if (isComposeEmpty(cur)) return;
     if (!cur.from_account) return;
+    const session = composeSession;
+    const wasCreating = !cur.draft_id;
     draftSaveInflight = true;
     try {
       const id = await invoke<string>("save_draft", {
@@ -1130,13 +1151,31 @@ function App() {
           references: cur.references,
         },
       });
-      if (!cur.draft_id) {
-        const latest = compose();
-        if (latest) setCompose({ ...latest, draft_id: id });
+      // Compose was discarded / replaced while we were in flight: do not
+      // graft the new id onto whatever the user is editing now. If we just
+      // created a brand new server draft it has no local owner — delete it
+      // so the user's Gmail Drafts folder doesn't accumulate orphans.
+      if (session !== composeSession) {
+        if (wasCreating) {
+          void invoke("delete_draft", {
+            email: cur.from_account,
+            draftId: id,
+          }).catch(() => {});
+        }
+        return;
       }
+      const latest = compose();
+      if (latest && !latest.draft_id) {
+        setCompose({ ...latest, draft_id: id });
+      }
+      // Pin the fingerprint to what we just persisted; the autosave effect
+      // uses this to suppress its immediate re-fire after we stamp the new
+      // draft_id back onto state.
+      lastSavedFingerprint = composeFingerprint(compose() ?? cur);
+      draftSaveErrorShown = false;
     } catch (err) {
       // Surface only the first failure so we don't spam the user on every
-      // keystroke when offline. Tracks a small per-session signal.
+      // keystroke when offline. The flag is reset on the next success.
       if (!draftSaveErrorShown) {
         showToast({
           message: `Draft autosave failed: ${err}`,
@@ -1148,16 +1187,50 @@ function App() {
       draftSaveInflight = false;
     }
   }
-  let draftSaveErrorShown = false;
+  function cancelPendingDraftSave() {
+    if (draftSaveTimer !== undefined) {
+      clearTimeout(draftSaveTimer);
+      draftSaveTimer = undefined;
+    }
+  }
+
+  // Fingerprint of the saveable fields. Used by the autosave effect to skip
+  // round-trips that wouldn't change the server-side draft — most notably
+  // the immediate re-fire we get when saveDraftNow stamps draft_id back on
+  // state via setCompose.
+  let lastSavedFingerprint = "";
+  function composeFingerprint(c: ComposeState): string {
+    return JSON.stringify({
+      a: c.from_account,
+      t: c.to,
+      c: c.cc,
+      b: c.bcc,
+      s: c.subject,
+      bd: c.body,
+      h: c.html_body ?? "",
+      // We don't include the base64 bytes — same {filename,size,mime}
+      // sequence implies same upload payload.
+      at: (c.attachments ?? []).map((a) => `${a.filename}|${a.size}|${a.mime_type}`),
+      r: c.in_reply_to ?? "",
+      x: c.references ?? "",
+    });
+  }
 
   createEffect(() => {
     const cur = compose();
-    if (!cur) return;
+    if (!cur) {
+      // Compose closed → reset the fingerprint so the next session starts
+      // dirty (otherwise the very first save would be skipped if the user
+      // re-types the same body).
+      lastSavedFingerprint = "";
+      return;
+    }
     // Skip server autosave for replies/forwards (the user usually wants the
     // draft local until they actually send) and for empty composes.
     if (cur.in_reply_to) return;
     if (cur.subject.startsWith("Fwd:")) return;
     if (isComposeEmpty(cur)) return;
+    if (composeFingerprint(cur) === lastSavedFingerprint) return;
     scheduleDraftSave();
   });
 
@@ -1225,6 +1298,7 @@ function App() {
 
   function openCompose() {
     setSendError(null);
+    bumpComposeSession();
     const restored = loadDraft();
     if (restored && !isComposeEmpty(restored)) {
       setCompose(restored);
@@ -1271,6 +1345,7 @@ function App() {
       ? `${detail.references} ${detail.message_id_header}`.trim()
       : detail.message_id_header;
     setSendError(null);
+    bumpComposeSession();
     setCompose({
       from_account: fromAccount,
       to: toList.join(", "),
@@ -1294,6 +1369,7 @@ function App() {
     );
     const fromAccount = senderMeta?.account_email ?? defaultFromAccount();
     setSendError(null);
+    bumpComposeSession();
     setCompose({
       from_account: fromAccount,
       to: "",
@@ -1328,6 +1404,11 @@ function App() {
         }).catch(() => {});
       }
     }
+    // Cancel a queued autosave and invalidate any in-flight one. Without
+    // this a pending save can land after discard and create an orphan
+    // draft on Gmail that we never reference again.
+    cancelPendingDraftSave();
+    bumpComposeSession();
     clearDraft();
     setCompose(null);
   }
@@ -1395,9 +1476,18 @@ function App() {
       fireSend(earlier);
     }
 
-    const payload: ComposeState = { ...cur };
+    // Flush any pending autosave so send_draft (which sends Gmail's server
+    // copy of the draft) sees the latest body. Without this a user who
+    // types and clicks Send within the 1.5s debounce loses those edits.
+    cancelPendingDraftSave();
+    await saveDraftNow();
+
+    // Re-read compose: saveDraftNow may have written back the draft_id.
+    const latest = compose() ?? cur;
+    const payload: ComposeState = { ...latest };
     pendingSendPayload = payload;
     clearDraft();
+    bumpComposeSession();
     setCompose(null);
 
     const undoMs = Math.max(0, settings().compose.undoSendSeconds) * 1000;
