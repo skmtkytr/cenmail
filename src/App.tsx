@@ -1952,9 +1952,18 @@ function App() {
     // Sanitized message iframes can't reach the host (opaque origin) so
     // they postMessage link clicks here. We validate the scheme before
     // handing the URL to the OS opener — only http(s) and mailto: pass.
+    // The same channel carries the vimium-mode `cenmail:blur` request
+    // which returns keyboard focus to the host so j/k navigation
+    // resumes.
     const onIframeMessage = (e: MessageEvent) => {
       const data = e.data as { type?: string; href?: string } | null;
-      if (!data || data.type !== "cenmail:open") return;
+      if (!data || typeof data.type !== "string") return;
+      if (data.type === "cenmail:blur") {
+        const active = document.activeElement;
+        if (active instanceof HTMLIFrameElement) active.blur();
+        return;
+      }
+      if (data.type !== "cenmail:open") return;
       const href = data.href;
       if (typeof href !== "string" || href.length === 0) return;
       try {

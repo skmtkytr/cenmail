@@ -7,6 +7,15 @@ type Entry = {
   label: string;
 };
 
+const IFRAME_ENTRIES: Entry[] = [
+  { combo: ["f"], label: "Show link hints" },
+  { combo: ["j", "k"], separator: " / ", label: "Scroll down / up" },
+  { combo: ["d", "u"], separator: " / ", label: "Half-page down / up" },
+  { combo: ["gg"], label: "Scroll to top" },
+  { combo: ["G"], label: "Scroll to bottom" },
+  { combo: ["Esc"], label: "Return focus to list" },
+];
+
 const ENTRIES: Entry[] = [
   { combo: ["j", "k"], separator: " / ", label: "Next / previous message" },
   { combo: ["e"], label: "Archive" },
@@ -68,6 +77,30 @@ export function ShortcutsHelpModal(props: {
                     <td
                       class={`py-1 pr-4 ${entry.separator === " + " ? "whitespace-nowrap" : ""}`}
                     >
+                      <For each={entry.combo}>
+                        {(key, i) => (
+                          <>
+                            <Show when={i() > 0}>{entry.separator}</Show>
+                            <kbd class={KBD_CLASS}>{key}</kbd>
+                          </>
+                        )}
+                      </For>
+                    </td>
+                    <td>{entry.label}</td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+          <h3 class="mt-5 mb-2 text-xs font-semibold uppercase tracking-wide text-[color:var(--color-muted)]">
+            Inside message body (click into preview first)
+          </h3>
+          <table class="w-full text-sm">
+            <tbody>
+              <For each={IFRAME_ENTRIES}>
+                {(entry) => (
+                  <tr>
+                    <td class="py-1 pr-4">
                       <For each={entry.combo}>
                         {(key, i) => (
                           <>

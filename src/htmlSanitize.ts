@@ -170,8 +170,19 @@ export function sanitizeMessageHtml(
   };
 }
 
+// Injected into the message-body iframe alongside the sanitized HTML.
+// Runs in an opaque-origin sandbox; can only talk to the host via
+// postMessage. Two responsibilities:
+//   1. Forward link clicks so the OS browser handles them.
+//   2. Vimium-like keyboard nav while the iframe has focus
+//      (f = link hints, j/k = scroll, gg/G = top/bottom, Esc = return).
+// Because cross-origin keydowns don't bubble to the host document, the
+// host's own keybinds keep working when the user is in the message
+// list / preview chrome — and these only fire when the iframe itself
+// is focused (typically via clicking inside the message body).
 const LINK_INTERCEPT_SCRIPT = `
 (function () {
+  // ---- Click forward ------------------------------------------------
   document.addEventListener('click', function (e) {
     var t = e.target;
     while (t && t.nodeType === 1 && t.tagName !== 'A') t = t.parentNode;
@@ -187,6 +198,152 @@ const LINK_INTERCEPT_SCRIPT = `
     try {
       parent.postMessage({ type: 'cenmail:open', href: t.href || href }, '*');
     } catch (err) {}
+  }, true);
+
+  // ---- Vimium-like keyboard nav ------------------------------------
+  var LABEL_CHARS = 'asdfghjkl'.split('');
+  var hintMode = false;
+  var hints = [];
+  var typed = '';
+  var lastG = 0;
+  var SCROLL_STEP = 60;
+
+  function genLabels(n) {
+    var out = [];
+    if (n <= LABEL_CHARS.length) {
+      for (var i = 0; i < n; i++) out.push(LABEL_CHARS[i]);
+      return out;
+    }
+    for (var i = 0; i < LABEL_CHARS.length; i++) {
+      for (var j = 0; j < LABEL_CHARS.length; j++) {
+        out.push(LABEL_CHARS[i] + LABEL_CHARS[j]);
+        if (out.length >= n) return out;
+      }
+    }
+    return out;
+  }
+
+  function clearHints() {
+    for (var i = 0; i < hints.length; i++) hints[i].marker.remove();
+    hints = [];
+    typed = '';
+    hintMode = false;
+  }
+
+  function showHints() {
+    if (hintMode) return;
+    var anchors = document.querySelectorAll('a[href]');
+    var visible = [];
+    for (var i = 0; i < anchors.length; i++) {
+      var r = anchors[i].getBoundingClientRect();
+      if (r.bottom < 0 || r.top > window.innerHeight) continue;
+      if (r.right < 0 || r.left > window.innerWidth) continue;
+      if (r.width === 0 && r.height === 0) continue;
+      visible.push({ el: anchors[i], rect: r });
+    }
+    if (visible.length === 0) return;
+    var labels = genLabels(visible.length);
+    for (var i = 0; i < visible.length; i++) {
+      var v = visible[i];
+      var m = document.createElement('div');
+      m.textContent = labels[i].toUpperCase();
+      // !important across the board so the email's own stylesheet
+      // can't drag the marker out of view via cascade.
+      var s = m.style;
+      s.setProperty('position', 'fixed', 'important');
+      s.setProperty('left', Math.max(0, v.rect.left) + 'px', 'important');
+      s.setProperty('top', Math.max(0, v.rect.top) + 'px', 'important');
+      s.setProperty('background', '#fef08a', 'important');
+      s.setProperty('color', '#111', 'important');
+      s.setProperty('border', '1px solid #b45309', 'important');
+      s.setProperty('border-radius', '2px', 'important');
+      s.setProperty('padding', '0 3px', 'important');
+      s.setProperty('font', 'bold 11px/1.4 monospace', 'important');
+      s.setProperty('z-index', '2147483647', 'important');
+      s.setProperty('pointer-events', 'none', 'important');
+      s.setProperty('box-shadow', '0 1px 2px rgba(0,0,0,.3)', 'important');
+      document.body.appendChild(m);
+      hints.push({ el: v.el, label: labels[i], marker: m });
+    }
+    hintMode = true;
+    typed = '';
+  }
+
+  function activateLabel(label) {
+    for (var i = 0; i < hints.length; i++) {
+      if (hints[i].label !== label) continue;
+      var a = hints[i].el;
+      var href = a.getAttribute('href');
+      clearHints();
+      if (href) {
+        var lower = href.toLowerCase();
+        if (lower.indexOf('javascript:') !== 0 && lower.indexOf('vbscript:') !== 0) {
+          try {
+            parent.postMessage({ type: 'cenmail:open', href: a.href || href }, '*');
+          } catch (err) {}
+        }
+      }
+      return;
+    }
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (hintMode) {
+      if (e.key === 'Escape') { e.preventDefault(); clearHints(); return; }
+      if (e.key.length === 1 && /[a-zA-Z]/.test(e.key)) {
+        e.preventDefault();
+        typed += e.key.toLowerCase();
+        var prefixCount = 0;
+        var exact = -1;
+        for (var i = 0; i < hints.length; i++) {
+          var match = hints[i].label.indexOf(typed) === 0;
+          hints[i].marker.style.setProperty(
+            'opacity', match ? '1' : '0.25', 'important'
+          );
+          if (match) {
+            prefixCount++;
+            if (hints[i].label === typed) exact = i;
+          }
+        }
+        if (prefixCount === 0) { clearHints(); return; }
+        if (exact >= 0 && prefixCount === 1) activateLabel(typed);
+      }
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    var tgt = e.target;
+    if (tgt && /^(INPUT|TEXTAREA|SELECT)$/.test(tgt.tagName)) return;
+    if (tgt && tgt.isContentEditable) return;
+    if (e.key === 'f') { e.preventDefault(); showHints(); return; }
+    if (e.key === 'j') { e.preventDefault(); window.scrollBy(0, SCROLL_STEP); return; }
+    if (e.key === 'k') { e.preventDefault(); window.scrollBy(0, -SCROLL_STEP); return; }
+    if (e.key === 'd') { e.preventDefault(); window.scrollBy(0, Math.floor(window.innerHeight / 2)); return; }
+    if (e.key === 'u') { e.preventDefault(); window.scrollBy(0, -Math.floor(window.innerHeight / 2)); return; }
+    if (e.key === 'G') {
+      e.preventDefault();
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      return;
+    }
+    if (e.key === 'g') {
+      // gg = top, dispatched as two presses within 500 ms.
+      var now = Date.now();
+      if (now - lastG < 500) {
+        e.preventDefault();
+        window.scrollTo(0, 0);
+        lastG = 0;
+      } else {
+        lastG = now;
+      }
+      return;
+    }
+    if (e.key === 'Escape') {
+      // Hand focus back to the host so its own keybinds (j/k message
+      // nav etc.) resume firing. The host listens for cenmail:blur and
+      // calls iframe.blur() on the platform side.
+      e.preventDefault();
+      try { parent.postMessage({ type: 'cenmail:blur' }, '*'); } catch (err) {}
+      return;
+    }
   }, true);
 })();
 `;
