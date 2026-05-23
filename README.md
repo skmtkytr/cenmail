@@ -70,11 +70,27 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Google
 | `Ctrl`+`Z` | Undo last action (archive / trash / snooze / star / spam) |
 | `r` / `a` / `f` | Reply / Reply all / Forward |
 | `c` | Compose new |
+| `Ctrl`+`K` | Command palette |
 | `/` | Search |
 | `Ctrl`+`Shift`+`R` | Sync now |
 | `Ctrl`+`Shift`+`1` / `2` | Switch to Mail / Calendar |
 | `?` | Show shortcut help |
 | `Esc` | Close modal / deselect |
+
+#### Inside the message body (vimium-style)
+
+Click into the rendered message body once to give the iframe focus, then:
+
+| Key | Action |
+|---|---|
+| `f` | Show link hints — type the label to open the link in the OS browser |
+| `j` / `k` | Scroll down / up |
+| `d` / `u` | Half-page down / up |
+| `gg` / `G` | Scroll to top / bottom |
+| `Esc` | Clear hints, or hand focus back to the list (so `j`/`k` resume navigating messages) |
+
+The bindings only fire while the iframe itself has focus — outside the
+message body the host's own shortcuts above keep working.
 
 ## Companion CLI: `cenmail-cli`
 
