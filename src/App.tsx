@@ -20,7 +20,25 @@ import {
   prefixSubject,
   type AccountSelection,
 } from "./utils";
+import { sanitizeMessageHtml } from "./htmlSanitize";
+import { ToastContainer, showToast } from "./toast";
+import { ConfirmHost, confirmModal } from "./modal";
 import "./App.css";
+
+const DRAFT_STORAGE_KEY = "cenmail:compose-draft";
+
+function usePrefersDark(): () => boolean {
+  const [dark, setDark] = createSignal(
+    typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-color-scheme: dark)").matches,
+  );
+  if (typeof window !== "undefined" && window.matchMedia) {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e: MediaQueryListEvent) => setDark(e.matches);
+    mq.addEventListener("change", handler);
+  }
+  return dark;
+}
 
 type Account = {
   id: number;
@@ -123,6 +141,10 @@ function readStoredWidth(key: keyof typeof PANE_DEFAULTS): number {
 }
 
 function App() {
+  const prefersDark = usePrefersDark();
+  const [allowImagesFor, setAllowImagesFor] = createSignal<Set<string>>(
+    new Set(),
+  );
   const [selectedFolder, setSelectedFolder] = createSignal("inbox");
   const [selectedAccount, setSelectedAccount] =
     createSignal<AccountSelection>("all");
@@ -172,7 +194,7 @@ function App() {
   }
 
   function clearMultiSelect() {
-    setSelectedIds(new Set());
+    setSelectedIds(new Set<string>());
     setAnchorId(null);
   }
 
@@ -470,7 +492,13 @@ function App() {
   }
 
   async function handleRemoveAccount(id: number) {
-    if (!confirm("Remove this account from cenmail?")) return;
+    const ok = await confirmModal({
+      title: "Remove account?",
+      body: "Cached messages will be deleted and the refresh token will be removed from the keyring.",
+      confirmLabel: "Remove",
+      destructive: true,
+    });
+    if (!ok) return;
     try {
       await invoke("remove_account", { id });
     } catch (err) {
@@ -513,6 +541,81 @@ function App() {
       setMessagesError(String(err));
       reloadAllVisible();
     }
+  }
+
+  async function untrashMessageAction(message: MessageMeta) {
+    try {
+      await invoke("untrash_message", {
+        email: message.account_email,
+        messageId: message.id,
+      });
+      reloadAllVisible();
+    } catch (err) {
+      setMessagesError(String(err));
+    }
+  }
+
+  function archiveWithUndo(targets: MessageMeta[]) {
+    if (targets.length === 0) return;
+    const snapshot = targets.slice();
+    for (const t of targets) void modifyLabels(t, [], ["INBOX"]);
+    showToast({
+      message: targets.length === 1 ? "Archived" : `Archived ${targets.length}`,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          for (const t of snapshot) void modifyLabels(t, ["INBOX"], []);
+          reloadAllVisible();
+        },
+      },
+    });
+  }
+
+  function trashWithUndo(targets: MessageMeta[]) {
+    if (targets.length === 0) return;
+    const snapshot = targets.slice();
+    for (const t of targets) void trashMessageAction(t);
+    showToast({
+      message:
+        targets.length === 1
+          ? "Moved to Trash"
+          : `Moved ${targets.length} to Trash`,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          for (const t of snapshot) void untrashMessageAction(t);
+        },
+      },
+    });
+  }
+
+  function starToggleWithUndo(targets: MessageMeta[]) {
+    if (targets.length === 0) return;
+    const snapshot = targets.slice();
+    const allStarred = snapshot.every((t) => t.label_ids.includes("STARRED"));
+    for (const t of snapshot) {
+      void modifyLabels(
+        t,
+        allStarred ? [] : ["STARRED"],
+        allStarred ? ["STARRED"] : [],
+      );
+    }
+    const noun = snapshot.length === 1 ? "" : ` ${snapshot.length}`;
+    showToast({
+      message: allStarred ? `Unstarred${noun}` : `Starred${noun}`,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          for (const t of snapshot) {
+            void modifyLabels(
+              t,
+              allStarred ? ["STARRED"] : [],
+              allStarred ? [] : ["STARRED"],
+            );
+          }
+        },
+      },
+    });
   }
 
   function applyLocalLabelChange(
@@ -587,6 +690,17 @@ function App() {
   const [sending, setSending] = createSignal(false);
   const [sendError, setSendError] = createSignal<string | null>(null);
 
+  // Autosave: only persist blank composes (reply / forward composes are
+  // initiated from a specific message and shouldn't survive across sessions).
+  createEffect(() => {
+    const cur = compose();
+    if (!cur) return;
+    if (cur.in_reply_to || cur.subject.startsWith("Fwd:")) return;
+    try {
+      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(cur));
+    } catch {}
+  });
+
   function defaultFromAccount(): string {
     const sel = selectedAccount();
     if (sel !== "all") {
@@ -596,8 +710,47 @@ function App() {
     return (accounts() ?? [])[0]?.email ?? "";
   }
 
+  function loadDraft(): ComposeState | null {
+    try {
+      const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as ComposeState;
+      // Sanity check: drafts saved before account removal can reference an
+      // account that no longer exists. Fall back to the default account.
+      const known = (accounts() ?? []).some(
+        (a) => a.email === parsed.from_account,
+      );
+      if (!known) parsed.from_account = defaultFromAccount();
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearDraft() {
+    try {
+      localStorage.removeItem(DRAFT_STORAGE_KEY);
+    } catch {}
+  }
+
+  function isComposeEmpty(c: ComposeState): boolean {
+    return (
+      c.to.trim() === "" &&
+      c.cc.trim() === "" &&
+      c.bcc.trim() === "" &&
+      c.subject.trim() === "" &&
+      c.body.trim() === ""
+    );
+  }
+
   function openCompose() {
     setSendError(null);
+    const restored = loadDraft();
+    if (restored && !isComposeEmpty(restored)) {
+      setCompose(restored);
+      showToast({ message: "Draft restored" });
+      return;
+    }
     setCompose({
       from_account: defaultFromAccount(),
       to: "",
@@ -669,8 +822,19 @@ function App() {
     });
   }
 
-  function closeCompose() {
+  async function closeCompose() {
     if (sending()) return;
+    const cur = compose();
+    if (cur && !isComposeEmpty(cur)) {
+      const ok = await confirmModal({
+        title: "Discard this draft?",
+        body: "Your message will be lost.",
+        confirmLabel: "Discard",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    clearDraft();
     setCompose(null);
   }
 
@@ -710,7 +874,9 @@ function App() {
           references: cur.references,
         },
       });
+      clearDraft();
       setCompose(null);
+      showToast({ message: "Sent" });
     } catch (err) {
       setSendError(String(err));
     } finally {
@@ -786,6 +952,18 @@ function App() {
         return;
       }
     }
+    // Global re-sync: Ctrl/Cmd + Shift + R. Placed before the editable-target
+    // bail so it works even when the search field has focus.
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.shiftKey &&
+      e.key.toLowerCase() === "r"
+    ) {
+      e.preventDefault();
+      handleRefresh();
+      return;
+    }
+
     if (isEditableTarget(e.target)) return;
 
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
@@ -817,9 +995,7 @@ function App() {
         );
         if (targets.length > 0) {
           e.preventDefault();
-          for (const t of targets) {
-            void modifyLabels(t, [], ["INBOX"]);
-          }
+          archiveWithUndo(targets);
         }
         break;
       }
@@ -828,9 +1004,7 @@ function App() {
         const targets = bulk();
         if (targets.length > 0) {
           e.preventDefault();
-          for (const t of targets) {
-            void trashMessageAction(t);
-          }
+          trashWithUndo(targets);
         }
         break;
       }
@@ -838,16 +1012,7 @@ function App() {
         const targets = bulk();
         if (targets.length > 0) {
           e.preventDefault();
-          const allStarred = targets.every((t) =>
-            t.label_ids.includes("STARRED"),
-          );
-          for (const t of targets) {
-            void modifyLabels(
-              t,
-              allStarred ? [] : ["STARRED"],
-              allStarred ? ["STARRED"] : [],
-            );
-          }
+          starToggleWithUndo(targets);
         }
         break;
       }
@@ -1068,7 +1233,7 @@ function App() {
           </For>
         </nav>
         <div class="border-t border-[color:var(--color-border)] px-4 py-2 text-xs text-[color:var(--color-muted)]">
-          <Show when={aggregateSync()} fallback={<>Phase 3 · cache & sync</>}>
+          <Show when={aggregateSync()} fallback={<span>Idle</span>}>
             {(s) => (
               <span class={s().syncing ? "text-[color:var(--color-accent)]" : ""}>
                 {s().label}
@@ -1090,13 +1255,24 @@ function App() {
         class="flex shrink-0 flex-col border-r border-[color:var(--color-border)] bg-[color:var(--color-bg)]"
         style={{ width: `${listWidth()}px` }}
       >
-        <header class="flex items-center justify-between px-4 py-3">
+        <header class="flex items-center justify-between gap-2 px-4 py-3">
           <h2 class="truncate text-sm font-semibold">{headerTitle()}</h2>
-          <span class="text-xs text-[color:var(--color-muted)]">
-            {messagesLoading()
-              ? `${messages().length} ↻`
-              : `${messages().length.toLocaleString()} messages`}
-          </span>
+          <div class="flex shrink-0 items-center gap-2 text-xs text-[color:var(--color-muted)]">
+            <span>
+              {messagesLoading()
+                ? `${messages().length} ↻`
+                : `${messages().length.toLocaleString()} messages`}
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowShortcuts(true)}
+              title="Keyboard shortcuts (?)"
+              aria-label="Keyboard shortcuts"
+              class="rounded border border-[color:var(--color-border)] px-1.5 py-0.5 font-mono text-[10px] hover:bg-[color:var(--color-surface-hover)]"
+            >
+              ?
+            </button>
+          </div>
         </header>
         <div class="px-4 pb-2">
           <div class="flex items-center gap-2 rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 text-sm focus-within:border-[color:var(--color-accent)]">
@@ -1141,15 +1317,15 @@ function App() {
           >
             <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
               {(accounts() ?? []).length === 0
-                ? "アカウントを追加してください。"
+                ? "Add an account to get started."
                 : aggregateSync()?.syncing
-                  ? "同期中…"
-                  : "メッセージがありません。"}
+                  ? "Syncing…"
+                  : "No messages."}
             </li>
           </Show>
           <Show when={messagesLoading() && !hasCache()}>
             <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
-              読み込み中…
+              Loading…
             </li>
           </Show>
           <For each={messages()}>
@@ -1166,7 +1342,7 @@ function App() {
                     }
                     openContextMenu(e, m);
                   }}
-                  class={`flex cursor-pointer select-none items-start gap-3 border-b border-[color:var(--color-border)] px-4 py-3 hover:bg-[color:var(--color-surface-hover)] ${
+                  class={`group flex cursor-pointer select-none items-start gap-3 border-b border-[color:var(--color-border)] px-4 py-3 hover:bg-[color:var(--color-surface-hover)] ${
                     isSelected(m.id)
                       ? "bg-[color:var(--color-accent-bg)]"
                       : ""
@@ -1219,9 +1395,35 @@ function App() {
                       >
                         {fromParsed().name}
                       </span>
-                      <span class="shrink-0 text-xs">
-                        {formatRelativeDate(m.date_millis)}
-                      </span>
+                      <div class="flex shrink-0 items-center gap-1.5 text-xs">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            starToggleWithUndo([m]);
+                          }}
+                          title={
+                            m.label_ids.includes("STARRED")
+                              ? "Remove star"
+                              : "Star"
+                          }
+                          aria-label={
+                            m.label_ids.includes("STARRED")
+                              ? "Remove star"
+                              : "Star"
+                          }
+                          class={`text-sm leading-none ${
+                            m.label_ids.includes("STARRED")
+                              ? "text-yellow-500"
+                              : "text-transparent group-hover:text-[color:var(--color-muted)] hover:!text-yellow-500"
+                          }`}
+                        >
+                          ★
+                        </button>
+                        <span title={new Date(m.date_millis).toLocaleString()}>
+                          {formatRelativeDate(m.date_millis)}
+                        </span>
+                      </div>
                     </div>
                     <div
                       class={`truncate text-sm ${
@@ -1256,13 +1458,13 @@ function App() {
           when={selectedMessageId()}
           fallback={
             <div class="flex flex-1 items-center justify-center text-sm text-[color:var(--color-muted)]">
-              メッセージを選択してください。
+              Select a message to read.
             </div>
           }
         >
           <Show when={messageDetailLoading()}>
             <div class="p-8 text-sm text-[color:var(--color-muted)]">
-              読み込み中…
+              Loading…
             </div>
           </Show>
           <Show when={messageDetailError()}>
@@ -1312,7 +1514,7 @@ function App() {
                     {detail().date}
                   </div>
                 </header>
-                <div class="flex-1 overflow-hidden">
+                <div class="flex flex-1 flex-col overflow-hidden">
                   <Show
                     when={detail().html_body}
                     fallback={
@@ -1321,12 +1523,52 @@ function App() {
                       </pre>
                     }
                   >
-                    <iframe
-                      srcdoc={detail().html_body ?? ""}
-                      sandbox=""
-                      class="h-full w-full border-0 bg-white"
-                      title="message body"
-                    />
+                    {(() => {
+                      const id = detail().id;
+                      const allowed = () => allowImagesFor().has(id);
+                      const sanitized = createMemo(() =>
+                        sanitizeMessageHtml(detail().html_body ?? "", {
+                          allowRemoteImages: allowed(),
+                          dark: prefersDark(),
+                        }),
+                      );
+                      return (
+                        <>
+                          <Show
+                            when={
+                              !allowed() && sanitized().blockedImages > 0
+                            }
+                          >
+                            <div class="flex items-center justify-between border-b border-[color:var(--color-border)] bg-[color:var(--color-bg)] px-6 py-2 text-xs text-[color:var(--color-muted)]">
+                              <span>
+                                Remote images blocked to protect your privacy.
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const next = new Set(allowImagesFor());
+                                  next.add(id);
+                                  setAllowImagesFor(next);
+                                }}
+                                class="rounded border border-[color:var(--color-border)] px-2 py-0.5 text-xs hover:bg-[color:var(--color-surface-hover)]"
+                              >
+                                Show images
+                              </button>
+                            </div>
+                          </Show>
+                          <iframe
+                            srcdoc={sanitized().html}
+                            sandbox="allow-popups allow-popups-to-escape-sandbox"
+                            class={`h-full w-full flex-1 border-0 ${
+                              prefersDark()
+                                ? "bg-[color:var(--color-surface)]"
+                                : "bg-white"
+                            }`}
+                            title="message body"
+                          />
+                        </>
+                      );
+                    })()}
                   </Show>
                 </div>
               </>
@@ -1370,11 +1612,7 @@ function App() {
                   class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
                   onClick={() => {
                     closeContextMenu();
-                    void modifyLabels(
-                      m,
-                      isStarred() ? [] : ["STARRED"],
-                      isStarred() ? ["STARRED"] : [],
-                    );
+                    starToggleWithUndo([m]);
                   }}
                 >
                   {isStarred() ? "Remove star" : "Star"}
@@ -1387,7 +1625,7 @@ function App() {
                     class="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
                     onClick={() => {
                       closeContextMenu();
-                      void modifyLabels(m, [], ["INBOX"]);
+                      archiveWithUndo([m]);
                     }}
                   >
                     Archive
@@ -1417,7 +1655,7 @@ function App() {
                     if (inTrash()) {
                       void modifyLabels(m, [], ["TRASH"]);
                     } else {
-                      void trashMessageAction(m);
+                      trashWithUndo([m]);
                     }
                   }}
                 >
@@ -1521,6 +1759,22 @@ function App() {
                     </kbd>
                   </td>
                   <td>Search</td>
+                </tr>
+                <tr>
+                  <td class="py-1 pr-4 whitespace-nowrap">
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      Ctrl
+                    </kbd>{" "}
+                    +{" "}
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      Shift
+                    </kbd>{" "}
+                    +{" "}
+                    <kbd class="rounded bg-[color:var(--color-surface-active)] px-1.5 py-0.5 font-mono">
+                      R
+                    </kbd>
+                  </td>
+                  <td>Sync now</td>
                 </tr>
                 <tr>
                   <td class="py-1 pr-4">
@@ -1696,6 +1950,9 @@ function App() {
           </div>
         )}
       </Show>
+
+      <ToastContainer />
+      <ConfirmHost />
     </div>
   );
 }

@@ -27,6 +27,7 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Gmail-only for 
 | `r` / `a` / `f` | Reply / Reply all / Forward |
 | `c` | Compose new |
 | `/` | Search |
+| `Ctrl`+`Shift`+`R` | Sync now |
 | `?` | Show shortcut help |
 | `Esc` | Close modal / deselect |
 
