@@ -197,6 +197,59 @@ export function SettingsModal(props: {
                   </For>
                 </select>
               </Field>
+              <Field label="Start new messages in rich text">
+                <Toggle
+                  checked={settings().compose.richTextDefault}
+                  onChange={(v) =>
+                    updateSettings((s) => ({
+                      ...s,
+                      compose: { ...s.compose, richTextDefault: v },
+                    }))
+                  }
+                />
+              </Field>
+              <Show when={props.accounts.length > 0}>
+                <div class="mb-3">
+                  <div class="mb-1.5 text-sm">Per-account signature</div>
+                  <p class="mb-2 text-xs text-[color:var(--color-muted)]">
+                    Appended to the bottom of new messages. Replies and
+                    forwards don't get the signature automatically.
+                  </p>
+                  <div class="flex flex-col gap-2">
+                    <For each={props.accounts}>
+                      {(a) => {
+                        const value = () =>
+                          settings().compose.signatures[a.email] ?? "";
+                        return (
+                          <div class="flex flex-col gap-1">
+                            <label class="text-xs font-mono text-[color:var(--color-muted)]">
+                              {a.email}
+                            </label>
+                            <textarea
+                              value={value()}
+                              onInput={(e) =>
+                                updateSettings((s) => ({
+                                  ...s,
+                                  compose: {
+                                    ...s.compose,
+                                    signatures: {
+                                      ...s.compose.signatures,
+                                      [a.email]: e.currentTarget.value,
+                                    },
+                                  },
+                                }))
+                              }
+                              rows={3}
+                              placeholder="Your signature…"
+                              class="resize-y rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 text-xs"
+                            />
+                          </div>
+                        );
+                      }}
+                    </For>
+                  </div>
+                </div>
+              </Show>
             </section>
 
             <section>

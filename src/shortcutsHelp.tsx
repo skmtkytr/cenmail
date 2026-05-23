@@ -22,6 +22,7 @@ const ENTRIES: Entry[] = [
     label: "Reply / Reply all / Forward",
   },
   { combo: ["c"], label: "Compose new" },
+  { combo: ["Ctrl", "K"], separator: " + ", label: "Command palette" },
   { combo: ["/"], label: "Search" },
   { combo: ["Ctrl", "Shift", "R"], separator: " + ", label: "Sync now" },
   {

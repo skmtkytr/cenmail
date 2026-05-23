@@ -113,6 +113,11 @@ describe("matchesFolder", () => {
     expect(matchesFolder(["INBOX"], "trash")).toBe(false);
   });
 
+  it("matches DRAFT for drafts folder only", () => {
+    expect(matchesFolder(["DRAFT"], "drafts")).toBe(true);
+    expect(matchesFolder(["INBOX"], "drafts")).toBe(false);
+  });
+
   it("returns true for unknown folder name", () => {
     expect(matchesFolder(["INBOX"], "anything-else")).toBe(true);
   });

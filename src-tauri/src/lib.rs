@@ -13,11 +13,12 @@ use rusqlite::params;
 use tauri::Manager;
 
 use commands::{
-    add_account, cancel_scheduled, create_event, delete_event, get_message, get_thread,
-    list_accounts, list_calendars, list_events_cached, list_messages, list_scheduled,
-    list_snoozed, modify_message, mute_thread, refresh_account, remove_account,
-    respond_to_event, respond_to_invite, schedule_send, send_message, snooze_message,
-    sync_account, sync_calendar_events, trash_message, unmute_thread, unsnooze_message,
+    add_account, cancel_scheduled, create_event, delete_draft, delete_event, get_attachment,
+    get_message, get_thread, list_accounts, list_calendars, list_events_cached,
+    list_messages, list_scheduled, list_snoozed, modify_message, mute_thread,
+    refresh_account, remove_account, respond_to_event, respond_to_invite, save_draft,
+    schedule_send, send_draft, send_message, snooze_message, sync_account,
+    sync_calendar_events, trash_message, unmute_thread, unread_counts, unsnooze_message,
     untrash_message, update_event, AppState,
 };
 
@@ -81,12 +82,17 @@ pub fn run() {
             refresh_account,
             sync_account,
             list_messages,
+            unread_counts,
             get_message,
             get_thread,
+            get_attachment,
             modify_message,
             trash_message,
             untrash_message,
             send_message,
+            save_draft,
+            delete_draft,
+            send_draft,
             snooze_message,
             unsnooze_message,
             list_snoozed,

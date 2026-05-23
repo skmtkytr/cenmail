@@ -192,11 +192,200 @@ pub async fn sync_account(
     state: State<'_, AppState>,
     email: String,
 ) -> Result<usize, String> {
+    // Bootstrap path runs the first time we sync an account or whenever
+    // Gmail's history watermark has been GC'd (history records expire after
+    // ~7 days). Incremental path replaces it for steady-state sync, costing
+    // O(diff) instead of O(mailbox).
+    let stored_history_id: Option<u64> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT history_id FROM accounts WHERE email = ?1",
+            params![email],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+        .map(|v| v as u64)
+    };
+
+    if let Some(start) = stored_history_id {
+        match incremental_sync(&app, &state, &email, start).await {
+            Ok(touched) => return Ok(touched),
+            Err(SyncErr::Expired) => {
+                tracing::info!(%email, "sync: history expired, falling through to bootstrap");
+                // fall through
+            }
+            Err(SyncErr::Other(e)) => return Err(e),
+        }
+    }
+
+    bootstrap_sync(&app, &state, &email).await
+}
+
+enum SyncErr {
+    Expired,
+    Other(String),
+}
+
+/// Fetch only the diff since `start_history_id` via Gmail's history.list. New
+/// messages are pulled in parallel via the existing metadata fetcher; label
+/// updates and deletions are applied without any extra round trips because
+/// the history payload already carries the post-change labelIds.
+async fn incremental_sync(
+    app: &AppHandle,
+    state: &AppState,
+    email: &str,
+    start_history_id: u64,
+) -> Result<usize, SyncErr> {
+    let outcome = with_token(state, email, move |http, token| {
+        Box::pin(async move {
+            gmail::messages::fetch_history(http, token, start_history_id).await
+        })
+    })
+    .await
+    .map_err(|e| SyncErr::Other(format!("history.list: {e:#}")))?;
+
+    let (latest_id, records) = match outcome {
+        gmail::messages::HistoryOutcome::Expired => return Err(SyncErr::Expired),
+        gmail::messages::HistoryOutcome::Synced {
+            latest_history_id,
+            records,
+        } => (latest_history_id, records),
+    };
+
+    use std::collections::{HashMap, HashSet};
+    let mut added_ids: HashSet<String> = HashSet::new();
+    let mut deleted_ids: HashSet<String> = HashSet::new();
+    // For label changes, the API returns the *resulting* label_ids on each
+    // message, so we just take the last value we see and overwrite.
+    let mut relabeled: HashMap<String, Vec<String>> = HashMap::new();
+
+    for rec in &records {
+        for ma in &rec.messages_added {
+            added_ids.insert(ma.message.id.clone());
+            if let Some(labels) = &ma.message.label_ids {
+                relabeled.insert(ma.message.id.clone(), labels.clone());
+            }
+        }
+        for md in &rec.messages_deleted {
+            // Gmail can both add then delete in the same history window;
+            // honor the latest signal.
+            added_ids.remove(&md.message.id);
+            relabeled.remove(&md.message.id);
+            deleted_ids.insert(md.message.id.clone());
+        }
+        for la in rec.labels_added.iter().chain(rec.labels_removed.iter()) {
+            if deleted_ids.contains(&la.message.id) {
+                continue;
+            }
+            if let Some(labels) = &la.message.label_ids {
+                relabeled.insert(la.message.id.clone(), labels.clone());
+            }
+        }
+    }
+
+    // Apply deletions immediately (cheap, no network).
+    if !deleted_ids.is_empty() {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| SyncErr::Other(format!("db lock: {e}")))?;
+        for id in &deleted_ids {
+            let _ = conn.execute(
+                "DELETE FROM messages WHERE account_email = ?1 AND id = ?2",
+                params![email, id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM message_bodies WHERE account_email = ?1 AND id = ?2",
+                params![email, id],
+            );
+        }
+    }
+
+    // Apply label-only updates against cached rows.
+    if !relabeled.is_empty() {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| SyncErr::Other(format!("db lock: {e}")))?;
+        for (id, labels) in &relabeled {
+            // Skip rows we don't have cached yet — they'll be inserted below
+            // via the metadata fetch.
+            if added_ids.contains(id) {
+                continue;
+            }
+            let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".into());
+            let unread = labels.iter().any(|l| l == "UNREAD") as i64;
+            let (bi, bs, bt, bsp, bse, bd, bc) = label_bits(labels);
+            let _ = conn.execute(
+                "UPDATE messages SET label_ids = ?1, unread = ?2,
+                    has_inbox = ?3, has_starred = ?4, has_trash = ?5, has_spam = ?6,
+                    has_sent = ?7, has_draft = ?8, has_chat = ?9
+                 WHERE account_email = ?10 AND id = ?11",
+                params![
+                    labels_json, unread, bi, bs, bt, bsp, bse, bd, bc, email, id
+                ],
+            );
+        }
+    }
+
+    // Fetch metadata for genuinely-new messages in parallel.
+    let new_ids: Vec<String> = added_ids.into_iter().collect();
+    let total = new_ids.len();
+    let _ = app.emit(
+        "sync:progress",
+        &SyncProgress {
+            email: email.to_string(),
+            fetched: 0,
+            total,
+        },
+    );
+    if total > 0 {
+        fetch_and_flush(app, state, email, new_ids)
+            .await
+            .map_err(SyncErr::Other)?;
+    }
+
+    if let Some(id) = latest_id {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| SyncErr::Other(format!("db lock: {e}")))?;
+        let _ = conn.execute(
+            "UPDATE accounts SET history_id = ?1 WHERE email = ?2",
+            params![id as i64, email],
+        );
+    }
+
+    let touched = total + deleted_ids.len() + relabeled.len();
+    let _ = app.emit(
+        "sync:done",
+        &SyncDone {
+            email: email.to_string(),
+            total: touched,
+        },
+    );
+    tracing::info!(
+        %email,
+        added = total,
+        deleted = deleted_ids.len(),
+        relabeled = relabeled.len(),
+        "sync: history applied"
+    );
+    Ok(touched)
+}
+
+/// Full bootstrap: list all message ids (with an `after:` filter to keep the
+/// initial round-trip bounded), fetch metadata for the diff, and persist the
+/// current historyId so subsequent calls use the incremental path.
+async fn bootstrap_sync(
+    app: &AppHandle,
+    state: &AppState,
+    email: &str,
+) -> Result<usize, String> {
     // If we already have messages for this account, ask Gmail only for
     // anything newer than the freshest one we know about (with a 1-hour
-    // safety buffer for clock skew / late deliveries). This turns the
-    // background sync into a few-second incremental query instead of a
-    // full pageToken walk of every message in the mailbox.
+    // safety buffer for clock skew / late deliveries).
     let after_seconds: Option<i64> = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let max_ms: Option<i64> = conn
@@ -212,7 +401,7 @@ pub async fn sync_account(
     let query = after_seconds.map(|s| format!("after:{s}"));
     let query_param = query.clone();
 
-    let all_ids = with_token(&state, &email, |http, token| {
+    let all_ids = with_token(state, email, move |http, token| {
         let q = query_param.clone();
         Box::pin(async move {
             gmail::messages::list_message_ids(http, token, q.as_deref()).await
@@ -225,17 +414,14 @@ pub async fn sync_account(
         let _ = app.emit(
             "sync:error",
             &SyncError {
-                email: email.clone(),
+                email: email.to_string(),
                 error: msg.clone(),
             },
         );
         msg
     })?;
-    tracing::info!(%email, query = ?query, listed = all_ids.len(), "sync: listed ids");
+    tracing::info!(%email, query = ?query, listed = all_ids.len(), "sync: bootstrap listed ids");
 
-    // Skip IDs we've already fetched. `messages.list` returns newest-first, so
-    // preserving order in the resulting Vec keeps the fresh stuff at the front
-    // for `buffered` to emit first.
     let ids: Vec<String> = {
         use std::collections::HashSet;
         let known: HashSet<String> = {
@@ -253,34 +439,65 @@ pub async fn sync_account(
     };
 
     let total = ids.len();
-    tracing::info!(%email, total, "sync: fetching new messages");
+    tracing::info!(%email, total, "sync: bootstrap fetching new messages");
     let _ = app.emit(
         "sync:progress",
         &SyncProgress {
-            email: email.clone(),
+            email: email.to_string(),
             fetched: 0,
             total,
         },
     );
 
-    if total == 0 {
-        let _ = app.emit(
-            "sync:done",
-            &SyncDone {
-                email: email.clone(),
-                total,
-            },
-        );
-        return Ok(0);
+    if total > 0 {
+        fetch_and_flush(app, state, email, ids).await?;
     }
 
+    // Capture the current historyId now so future syncs go through the
+    // incremental path. Best-effort: if profile fetch fails we'll just
+    // bootstrap again next time.
+    let profile = with_token(state, email, |http, token| {
+        Box::pin(async move { gmail::messages::fetch_profile(http, token).await })
+    })
+    .await
+    .ok();
+    if let Some(p) = profile {
+        if let Some(id) = p.history_id.as_deref().and_then(|s| s.parse::<u64>().ok()) {
+            if let Ok(conn) = state.db.lock() {
+                let _ = conn.execute(
+                    "UPDATE accounts SET history_id = ?1 WHERE email = ?2",
+                    params![id as i64, email],
+                );
+            }
+        }
+    }
+
+    let _ = app.emit(
+        "sync:done",
+        &SyncDone {
+            email: email.to_string(),
+            total,
+        },
+    );
+    Ok(total)
+}
+
+/// Parallel-fetch metadata for `ids` and persist into `messages`. Emits
+/// `sync:progress` every `SYNC_PROGRESS_EVERY` items.
+async fn fetch_and_flush(
+    app: &AppHandle,
+    state: &AppState,
+    email: &str,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let total = ids.len();
     let mut buf: Vec<MessageMeta> = Vec::with_capacity(SYNC_BATCH);
     let mut fetched = 0usize;
 
     let http = state.http.clone();
     let cache = state.token_cache.clone();
     let config = state.oauth_config.clone();
-    let email_owned = email.clone();
+    let email_owned = email.to_string();
 
     let mut stream = stream::iter(ids)
         .map(move |id| {
@@ -304,7 +521,7 @@ pub async fn sync_account(
             let _ = app.emit(
                 "sync:progress",
                 &SyncProgress {
-                    email: email.clone(),
+                    email: email.to_string(),
                     fetched,
                     total,
                 },
@@ -312,15 +529,7 @@ pub async fn sync_account(
         }
     }
     flush_messages(&state.db, &mut buf)?;
-
-    let _ = app.emit(
-        "sync:done",
-        &SyncDone {
-            email: email.clone(),
-            total,
-        },
-    );
-    Ok(total)
+    Ok(())
 }
 
 #[tauri::command]
@@ -402,6 +611,62 @@ pub fn list_messages(
     rows.map_err(|err| err.to_string())
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct UnreadCount {
+    pub account_email: String,
+    pub folder: String,
+    pub count: i64,
+}
+
+/// Per-account unread counts for each folder the sidebar surfaces. The cost is
+/// O(matching rows) thanks to the `msg_unread` partial index combined with
+/// the has_inbox / has_starred / has_trash / has_spam bit columns.
+#[tauri::command]
+pub fn unread_counts(state: State<'_, AppState>) -> Result<Vec<UnreadCount>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT account_email,
+                    SUM(CASE WHEN has_inbox = 1   THEN 1 ELSE 0 END) AS inbox,
+                    SUM(CASE WHEN has_starred = 1 THEN 1 ELSE 0 END) AS pinned,
+                    SUM(CASE WHEN has_spam = 1    THEN 1 ELSE 0 END) AS spam,
+                    SUM(CASE WHEN has_trash = 1   THEN 1 ELSE 0 END) AS trash
+             FROM messages
+             WHERE unread = 1
+             GROUP BY account_email",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let acc: String = r.get(0)?;
+            let inbox: i64 = r.get(1)?;
+            let pinned: i64 = r.get(2)?;
+            let spam: i64 = r.get(3)?;
+            let trash: i64 = r.get(4)?;
+            Ok((acc, inbox, pinned, spam, trash))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows.flatten() {
+        let (acc, inbox, pinned, spam, trash) = r;
+        for (folder, count) in [
+            ("inbox", inbox),
+            ("pinned", pinned),
+            ("spam", spam),
+            ("trash", trash),
+        ] {
+            if count > 0 {
+                out.push(UnreadCount {
+                    account_email: acc.clone(),
+                    folder: folder.to_string(),
+                    count,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn escape_like(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 2);
     out.push('%');
@@ -419,10 +684,14 @@ fn escape_like(input: &str) -> String {
 }
 
 fn folder_where_clause(folder: &str) -> &'static str {
+    // Bit columns are populated by `label_bits` whenever we INSERT or UPDATE a
+    // message; see flush_messages / update_message_labels. They are indexed
+    // (partial indexes per flag) so the queries below cost O(matching rows).
     match folder {
-        "inbox" => " AND label_ids LIKE '%\"INBOX\"%'",
-        "pinned" => " AND label_ids LIKE '%\"STARRED\"%'",
-        "sent" => " AND label_ids LIKE '%\"SENT\"%'",
+        "inbox" => " AND has_inbox = 1",
+        "pinned" => " AND has_starred = 1",
+        "sent" => " AND has_sent = 1",
+        "drafts" => " AND has_draft = 1",
         "snoozed" => {
             " AND EXISTS (
                 SELECT 1 FROM snoozes s
@@ -431,22 +700,33 @@ fn folder_where_clause(folder: &str) -> &'static str {
             )"
         }
         "archive" => {
-            " AND label_ids NOT LIKE '%\"INBOX\"%' \
-              AND label_ids NOT LIKE '%\"SENT\"%' \
-              AND label_ids NOT LIKE '%\"TRASH\"%' \
-              AND label_ids NOT LIKE '%\"DRAFT\"%' \
-              AND label_ids NOT LIKE '%\"SPAM\"%' \
-              AND label_ids NOT LIKE '%\"CHAT\"%' \
+            " AND has_inbox = 0 AND has_sent = 0 AND has_trash = 0 \
+              AND has_draft = 0 AND has_spam = 0 AND has_chat = 0 \
               AND NOT EXISTS (
                 SELECT 1 FROM snoozes s
                 WHERE s.account_email = messages.account_email
                   AND s.message_id = messages.id
               )"
         }
-        "trash" => " AND label_ids LIKE '%\"TRASH\"%'",
-        "spam" => " AND label_ids LIKE '%\"SPAM\"%'",
+        "trash" => " AND has_trash = 1",
+        "spam" => " AND has_spam = 1",
         _ => "",
     }
+}
+
+/// Map a labels slice into the seven bit columns we store on `messages`.
+/// Returns `(inbox, starred, trash, spam, sent, draft, chat)`.
+fn label_bits(labels: &[String]) -> (i64, i64, i64, i64, i64, i64, i64) {
+    let has = |name: &str| labels.iter().any(|l| l == name) as i64;
+    (
+        has("INBOX"),
+        has("STARRED"),
+        has("TRASH"),
+        has("SPAM"),
+        has("SENT"),
+        has("DRAFT"),
+        has("CHAT"),
+    )
 }
 
 #[cfg(test)]
@@ -469,7 +749,20 @@ mod tests {
                 unread INTEGER NOT NULL DEFAULT 0,
                 label_ids TEXT NOT NULL DEFAULT '[]',
                 fetched_at TEXT NOT NULL,
+                has_inbox INTEGER NOT NULL DEFAULT 0,
+                has_starred INTEGER NOT NULL DEFAULT 0,
+                has_trash INTEGER NOT NULL DEFAULT 0,
+                has_spam INTEGER NOT NULL DEFAULT 0,
+                has_sent INTEGER NOT NULL DEFAULT 0,
+                has_draft INTEGER NOT NULL DEFAULT 0,
+                has_chat INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (account_email, id)
+            );
+            CREATE TABLE snoozes (
+                account_email TEXT NOT NULL,
+                message_id    TEXT NOT NULL,
+                fire_at_ms    INTEGER NOT NULL,
+                PRIMARY KEY (account_email, message_id)
             );
             "#,
         )
@@ -479,29 +772,61 @@ mod tests {
 
     fn insert(conn: &Connection, id: &str, subject: &str, labels: &[&str], unread: i64) {
         let labels_json = serde_json::to_string(labels).unwrap();
+        let has = |n: &str| labels.iter().any(|l| *l == n) as i64;
         conn.execute(
             "INSERT INTO messages
              (id, account_email, thread_id, from_header, subject, snippet,
-              date_millis, unread, label_ids, fetched_at)
-             VALUES (?1, 'a@example.com', NULL, 'A <a@example.com>', ?2, '', 0, ?3, ?4, 'now')",
-            params![id, subject, unread, labels_json],
+              date_millis, unread, label_ids, fetched_at,
+              has_inbox, has_starred, has_trash, has_spam, has_sent,
+              has_draft, has_chat)
+             VALUES (?1, 'a@example.com', NULL, 'A <a@example.com>', ?2, '',
+                     0, ?3, ?4, 'now', ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id, subject, unread, labels_json,
+                has("INBOX"), has("STARRED"), has("TRASH"), has("SPAM"),
+                has("SENT"), has("DRAFT"), has("CHAT"),
+            ],
         )
         .unwrap();
     }
 
     #[test]
-    fn folder_where_inbox_picks_inbox_label() {
-        assert!(folder_where_clause("inbox").contains("\"INBOX\""));
-        assert!(folder_where_clause("inbox").contains("LIKE"));
+    fn folder_where_inbox_uses_bit_column() {
+        assert_eq!(folder_where_clause("inbox"), " AND has_inbox = 1");
     }
 
     #[test]
-    fn folder_where_archive_excludes_system_labels() {
+    fn folder_where_archive_excludes_system_bits_and_snoozes() {
         let archive = folder_where_clause("archive");
-        for label in ["INBOX", "SENT", "TRASH", "DRAFT", "SPAM", "CHAT"] {
-            assert!(archive.contains(&format!("\"{label}\"")), "missing {label}");
-            assert!(archive.contains("NOT LIKE"));
+        for col in [
+            "has_inbox = 0",
+            "has_sent = 0",
+            "has_trash = 0",
+            "has_draft = 0",
+            "has_spam = 0",
+            "has_chat = 0",
+        ] {
+            assert!(archive.contains(col), "missing predicate {col}");
         }
+        assert!(archive.contains("NOT EXISTS"));
+        assert!(archive.contains("snoozes"));
+    }
+
+    #[test]
+    fn label_bits_maps_known_labels() {
+        let labels = vec![
+            "INBOX".to_string(),
+            "STARRED".to_string(),
+            "CATEGORY_PROMOTIONS".to_string(),
+        ];
+        let (i, s, t, sp, se, d, c) = label_bits(&labels);
+        assert_eq!((i, s, t, sp, se, d, c), (1, 1, 0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn label_bits_empty() {
+        let (i, s, t, sp, se, d, c) = label_bits(&[]);
+        assert_eq!((i, s, t, sp, se, d, c), (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]
@@ -531,6 +856,7 @@ mod tests {
         insert(&conn, "m3", "sent", &["SENT"], 0);
         insert(&conn, "m4", "archived", &["CATEGORY_PERSONAL"], 0);
         insert(&conn, "m5", "in trash", &["TRASH"], 0);
+        insert(&conn, "m6", "in spam", &["SPAM"], 0);
 
         for (folder, expected) in [
             ("inbox", vec!["m1"]),
@@ -538,6 +864,7 @@ mod tests {
             ("sent", vec!["m3"]),
             ("archive", vec!["m2", "m4"]),
             ("trash", vec!["m5"]),
+            ("spam", vec!["m6"]),
         ] {
             let sql = format!(
                 "SELECT id FROM messages WHERE 1=1 {clause} ORDER BY id",
@@ -604,12 +931,38 @@ pub async fn get_message(
 }
 
 #[tauri::command]
+pub async fn get_attachment(
+    state: State<'_, AppState>,
+    email: String,
+    message_id: String,
+    attachment_id: String,
+) -> Result<String, String> {
+    let mid = message_id.clone();
+    let aid = attachment_id.clone();
+    with_token(&state, &email, move |http, token| {
+        let mid = mid.clone();
+        let aid = aid.clone();
+        Box::pin(async move {
+            gmail::messages::fetch_attachment(http, token, &mid, &aid).await
+        })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(%email, %message_id, error = %format!("{e:#}"), "get_attachment failed");
+        format!("{e:#}")
+    })
+}
+
+#[tauri::command]
 pub async fn get_thread(
     state: State<'_, AppState>,
     email: String,
     thread_id: String,
 ) -> Result<Vec<MessageDetail>, String> {
-    let ids: Vec<String> = {
+    // Cached message ids in the thread, in delivery order. We use this both to
+    // decide if we even need to hit Gmail (fully cached threads avoid an HTTP
+    // round-trip) and to filter cached rows out of the per-message fetch.
+    let cached_ids: Vec<String> = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
@@ -623,46 +976,69 @@ pub async fn get_thread(
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        let cached: Option<MessageDetail> = {
+
+    // If every cached id has a full body cached, return them straight from
+    // sqlite without touching Gmail.
+    if !cached_ids.is_empty() {
+        let mut all_cached = Vec::with_capacity(cached_ids.len());
+        let mut missed = false;
+        {
             let conn = state.db.lock().map_err(|e| e.to_string())?;
-            conn.query_row(
-                "SELECT detail_json FROM message_bodies
-                 WHERE account_email = ?1 AND id = ?2",
-                params![email, id],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|j| serde_json::from_str::<MessageDetail>(&j).ok())
-        };
-        if let Some(d) = cached {
-            out.push(d);
-            continue;
-        }
-        match fetch_full_with_retry(&state, &email, &id).await {
-            Ok(detail) => {
-                if let Ok(json) = serde_json::to_string(&detail) {
-                    if let Ok(conn) = state.db.lock() {
-                        let _ = conn.execute(
-                            "INSERT OR REPLACE INTO message_bodies
-                             (account_email, id, detail_json, fetched_at)
-                             VALUES (?1, ?2, ?3, ?4)",
-                            params![email, id, json, Utc::now().to_rfc3339()],
-                        );
+            for id in &cached_ids {
+                let row: Option<String> = conn
+                    .query_row(
+                        "SELECT detail_json FROM message_bodies
+                         WHERE account_email = ?1 AND id = ?2",
+                        params![email, id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok();
+                match row.and_then(|j| serde_json::from_str::<MessageDetail>(&j).ok()) {
+                    Some(d) => all_cached.push(d),
+                    None => {
+                        missed = true;
+                        break;
                     }
                 }
-                out.push(detail);
             }
-            Err(e) => {
-                tracing::warn!(%email, %id, error = %format!("{e:#}"), "get_thread: skipping unfetchable message");
+        }
+        if !missed {
+            return Ok(all_cached);
+        }
+    }
+
+    // Otherwise pull the whole thread in a single Gmail call (one HTTP
+    // round-trip per thread, vs one per message in the old impl) and write
+    // each message body back into the cache.
+    let tid_owned = thread_id.clone();
+    let details = with_token(&state, &email, move |http, token| {
+        let tid = tid_owned.clone();
+        Box::pin(
+            async move { gmail::messages::fetch_thread_full(http, token, &tid).await },
+        )
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(%email, %thread_id, error = %format!("{e:#}"), "get_thread failed");
+        format!("{e:#}")
+    })?;
+
+    if !details.is_empty() {
+        if let Ok(conn) = state.db.lock() {
+            let now = Utc::now().to_rfc3339();
+            for d in &details {
+                if let Ok(json) = serde_json::to_string(d) {
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO message_bodies
+                         (account_email, id, detail_json, fetched_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![email, d.id, json, now],
+                    );
+                }
             }
         }
     }
-    Ok(out)
+    Ok(details)
 }
 
 async fn fetch_metadata_with_retry(
@@ -862,6 +1238,15 @@ pub async fn untrash_message(
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    /// Standard base64 (with padding) of the attachment bytes.
+    pub data_b64: String,
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendRequest {
@@ -874,8 +1259,25 @@ pub struct SendRequest {
     pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
+    #[serde(default)]
+    pub html_body: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<OutgoingAttachment>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
+}
+
+fn to_compose_attachments(
+    items: Vec<OutgoingAttachment>,
+) -> Vec<gmail::compose::ComposeAttachment> {
+    items
+        .into_iter()
+        .map(|a| gmail::compose::ComposeAttachment {
+            filename: a.filename,
+            mime_type: a.mime_type,
+            data_b64: a.data_b64,
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -902,6 +1304,8 @@ pub async fn send_message(
         bcc: request.bcc,
         subject: request.subject,
         body: request.body,
+        html_body: request.html_body,
+        attachments: to_compose_attachments(request.attachments),
         in_reply_to: request.in_reply_to,
         references: request.references,
     };
@@ -914,6 +1318,107 @@ pub async fn send_message(
     .await
     .map_err(|e| {
         tracing::error!(error = %format!("{e:#}"), "send_message failed");
+        format!("{e:#}")
+    })
+}
+
+fn compose_from_request(state: &AppState, request: &SendRequest) -> Compose {
+    let display_name = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT display_name FROM accounts WHERE email = ?1",
+                params![request.from_account],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        });
+    Compose {
+        from: request.from_account.clone(),
+        from_name: display_name,
+        to: request.to.clone(),
+        cc: request.cc.clone(),
+        bcc: request.bcc.clone(),
+        subject: request.subject.clone(),
+        body: request.body.clone(),
+        html_body: request.html_body.clone(),
+        attachments: to_compose_attachments(request.attachments.clone()),
+        in_reply_to: request.in_reply_to.clone(),
+        references: request.references.clone(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDraftRequest {
+    /// When set, update an existing draft in place rather than creating a
+    /// new one. The frontend stashes the value returned by `save_draft` and
+    /// hands it back on subsequent autosaves.
+    pub draft_id: Option<String>,
+    #[serde(flatten)]
+    pub send: SendRequest,
+}
+
+#[tauri::command]
+pub async fn save_draft(
+    state: State<'_, AppState>,
+    request: SaveDraftRequest,
+) -> Result<String, String> {
+    let compose = compose_from_request(&state, &request.send);
+    let from_account = request.send.from_account.clone();
+    let existing = request.draft_id.clone();
+    with_token(&state, &from_account, move |http, token| {
+        let c = compose.clone();
+        let existing = existing.clone();
+        Box::pin(async move {
+            match existing {
+                Some(id) => gmail::compose::update_draft(http, token, &id, &c).await,
+                None => gmail::compose::create_draft(http, token, &c).await,
+            }
+        })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "save_draft failed");
+        format!("{e:#}")
+    })
+}
+
+#[tauri::command]
+pub async fn delete_draft(
+    state: State<'_, AppState>,
+    email: String,
+    draft_id: String,
+) -> Result<(), String> {
+    let did = draft_id.clone();
+    with_token(&state, &email, move |http, token| {
+        let id = did.clone();
+        Box::pin(async move { gmail::compose::delete_draft(http, token, &id).await })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "delete_draft failed");
+        format!("{e:#}")
+    })
+}
+
+#[tauri::command]
+pub async fn send_draft(
+    state: State<'_, AppState>,
+    email: String,
+    draft_id: String,
+) -> Result<String, String> {
+    let did = draft_id.clone();
+    with_token(&state, &email, move |http, token| {
+        let id = did.clone();
+        Box::pin(async move { gmail::compose::send_draft(http, token, &id).await })
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "send_draft failed");
         format!("{e:#}")
     })
 }
@@ -1756,6 +2261,8 @@ pub async fn fire_scheduled_send(
         bcc: req.bcc,
         subject: req.subject,
         body: req.body,
+        html_body: req.html_body,
+        attachments: to_compose_attachments(req.attachments),
         in_reply_to: req.in_reply_to,
         references: req.references,
     };
@@ -1781,10 +2288,17 @@ fn update_message_labels(
     } else {
         0
     };
+    let (b_inbox, b_starred, b_trash, b_spam, b_sent, b_draft, b_chat) = label_bits(labels);
     conn.execute(
-        "UPDATE messages SET label_ids = ?1, unread = ?2
-         WHERE account_email = ?3 AND id = ?4",
-        params![json_labels, unread, email, message_id],
+        "UPDATE messages SET label_ids = ?1, unread = ?2,
+            has_inbox = ?3, has_starred = ?4, has_trash = ?5, has_spam = ?6,
+            has_sent = ?7, has_draft = ?8, has_chat = ?9
+         WHERE account_email = ?10 AND id = ?11",
+        params![
+            json_labels, unread,
+            b_inbox, b_starred, b_trash, b_spam, b_sent, b_draft, b_chat,
+            email, message_id
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1804,12 +2318,17 @@ fn flush_messages(
         .prepare_cached(
             "INSERT OR REPLACE INTO messages
              (id, account_email, thread_id, from_header, subject, snippet,
-              date_millis, unread, label_ids, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              date_millis, unread, label_ids, fetched_at,
+              has_inbox, has_starred, has_trash, has_spam, has_sent,
+              has_draft, has_chat)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .map_err(|e| e.to_string())?;
     for m in buf.iter() {
         let labels_json = serde_json::to_string(&m.label_ids).unwrap_or_else(|_| "[]".into());
+        let (b_inbox, b_starred, b_trash, b_spam, b_sent, b_draft, b_chat) =
+            label_bits(&m.label_ids);
         stmt.execute(params![
             m.id,
             m.account_email,
@@ -1821,6 +2340,13 @@ fn flush_messages(
             if m.unread { 1 } else { 0 },
             labels_json,
             now,
+            b_inbox,
+            b_starred,
+            b_trash,
+            b_spam,
+            b_sent,
+            b_draft,
+            b_chat,
         ])
         .map_err(|e| e.to_string())?;
     }

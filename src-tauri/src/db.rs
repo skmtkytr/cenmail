@@ -138,12 +138,62 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // swallow.
     let _ = conn.execute("ALTER TABLE accounts ADD COLUMN picture_url TEXT", []);
     let _ = conn.execute("ALTER TABLE events ADD COLUMN ical_uid TEXT", []);
+    // Per-account Gmail historyId. NULL = needs a bootstrap (full list walk);
+    // any other value lets sync_account pull only the diff via history.list.
+    let _ = conn.execute("ALTER TABLE accounts ADD COLUMN history_id INTEGER", []);
+    // Per-label bit columns: avoid `LIKE '%"INBOX"%'` scans on the JSON-encoded
+    // label_ids. Each bit gets a partial index keyed on date so folder views
+    // collapse to a covered range scan.
+    for col in [
+        "has_inbox",
+        "has_starred",
+        "has_trash",
+        "has_spam",
+        "has_sent",
+        "has_draft",
+        "has_chat",
+    ] {
+        let _ = conn.execute(
+            &format!("ALTER TABLE messages ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+            [],
+        );
+    }
+    // Backfill bits for any row that still has label_ids populated but every
+    // flag at 0 (i.e. predates this migration). Runs once; subsequent calls
+    // skip work because flags will have been set by writers.
+    let _ = conn.execute(
+        "UPDATE messages SET
+            has_inbox   = (label_ids LIKE '%\"INBOX\"%'),
+            has_starred = (label_ids LIKE '%\"STARRED\"%'),
+            has_trash   = (label_ids LIKE '%\"TRASH\"%'),
+            has_spam    = (label_ids LIKE '%\"SPAM\"%'),
+            has_sent    = (label_ids LIKE '%\"SENT\"%'),
+            has_draft   = (label_ids LIKE '%\"DRAFT\"%'),
+            has_chat    = (label_ids LIKE '%\"CHAT\"%')
+         WHERE has_inbox = 0 AND has_starred = 0 AND has_trash = 0
+           AND has_spam  = 0 AND has_sent    = 0 AND has_draft  = 0
+           AND has_chat  = 0
+           AND label_ids != '[]'",
+        [],
+    );
 
     // Indexes on the new columns — safe to run after the migration succeeded
     // (or noop'd because the column already existed).
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS events_ical_uid
-           ON events (account_email, ical_uid);",
+           ON events (account_email, ical_uid);
+         CREATE INDEX IF NOT EXISTS msg_inbox
+           ON messages (account_email, date_millis DESC) WHERE has_inbox = 1;
+         CREATE INDEX IF NOT EXISTS msg_starred
+           ON messages (account_email, date_millis DESC) WHERE has_starred = 1;
+         CREATE INDEX IF NOT EXISTS msg_sent
+           ON messages (account_email, date_millis DESC) WHERE has_sent = 1;
+         CREATE INDEX IF NOT EXISTS msg_trash
+           ON messages (account_email, date_millis DESC) WHERE has_trash = 1;
+         CREATE INDEX IF NOT EXISTS msg_spam
+           ON messages (account_email, date_millis DESC) WHERE has_spam = 1;
+         CREATE INDEX IF NOT EXISTS msg_unread
+           ON messages (account_email) WHERE unread = 1;",
     )?;
     Ok(())
 }

@@ -1038,6 +1038,8 @@ async fn cmd_send(state: &AppState, args: SendArgs) -> Result<()> {
         bcc: args.bcc,
         subject: args.subject,
         body,
+        html_body: None,
+        attachments: Vec::new(),
         in_reply_to: args.in_reply_to,
         references: args.references,
     };

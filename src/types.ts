@@ -19,6 +19,16 @@ export type MessageMeta = {
   account_email: string;
 };
 
+export type Attachment = {
+  part_id: string;
+  attachment_id: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+  content_id: string | null;
+  inline: boolean;
+};
+
 export type MessageDetail = {
   id: string;
   thread_id: string | null;
@@ -34,6 +44,14 @@ export type MessageDetail = {
   calendar_body?: string | null;
   calendar_method?: string | null;
   calendar_uid?: string | null;
+  attachments?: Attachment[];
+};
+
+export type ComposeAttachment = {
+  filename: string;
+  mime_type: string;
+  size: number;
+  data_b64: string;
 };
 
 export type ComposeState = {
@@ -43,9 +61,17 @@ export type ComposeState = {
   bcc: string;
   subject: string;
   body: string;
+  // When set the message is sent as multipart/alternative with `body` as the
+  // text fallback. Empty / undefined → plain-text-only send.
+  html_body?: string;
+  attachments?: ComposeAttachment[];
+  // Gmail draft id once we've round-tripped the draft to the server. Used
+  // for in-place updates and to call drafts.send instead of messages.send.
+  draft_id?: string | null;
   in_reply_to: string | null;
   references: string | null;
   show_cc_bcc: boolean;
+  rich: boolean;
 };
 
 export type SyncProgress = { email: string; fetched: number; total: number };
@@ -65,6 +91,7 @@ export const FOLDERS: Folder[] = [
   { id: "inbox", label: "Inbox" },
   { id: "pinned", label: "Pinned" },
   { id: "snoozed", label: "Snoozed" },
+  { id: "drafts", label: "Drafts" },
   { id: "sent", label: "Sent" },
   { id: "archive", label: "Archive" },
   { id: "spam", label: "Spam" },

@@ -1,4 +1,11 @@
-import { For, Show } from "solid-js";
+import {
+  For,
+  Show,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { formatRelativeDate, parseFromHeader, type Bucket } from "./utils";
 import type { Account, MessageMeta } from "./types";
 
@@ -7,6 +14,12 @@ type BucketCounts = {
   newsletters: number;
   notifications: number;
 };
+
+// All rows share a fixed height so we can virtualize without measuring each
+// child. ROW_HEIGHT_PX must match the rendered MessageRow exactly — keep them
+// in sync if you change row padding/content.
+const ROW_HEIGHT_PX = 76;
+const OVERSCAN_ROWS = 6;
 
 export function MessageList(props: {
   width: number;
@@ -140,47 +153,128 @@ export function MessageList(props: {
           </For>
         </div>
       </Show>
-      <ul class="flex-1 overflow-y-auto">
-        <Show
-          when={
-            !props.messagesLoading &&
-            props.hasCache &&
-            props.messages.length === 0
-          }
-        >
-          <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
-            {props.accounts.length === 0
-              ? "Add an account to get started."
-              : props.syncingHint
-                ? "Syncing…"
-                : "No messages."}
-          </li>
-        </Show>
-        <Show when={props.messagesLoading && !props.hasCache}>
-          <li class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
-            Loading…
-          </li>
-        </Show>
-        <For each={props.messages}>
-          {(m) => (
-            <MessageRow
-              m={m}
-              active={props.selectedMessageId === m.id}
-              isSelected={props.isSelected(m.id)}
-              accounts={props.accounts}
-              onClick={(e) => props.onRowClick(e, m)}
-              onContextMenu={(e) => {
-                if (!props.isSelected(m.id)) {
-                  props.onSelectOnlyForContext(m);
-                }
-                props.onContextMenu(e, m);
-              }}
-              onToggleStar={() => props.onToggleStar(m)}
-            />
-          )}
-        </For>
-      </ul>
+      <VirtualizedList
+        messages={props.messages}
+        messagesLoading={props.messagesLoading}
+        hasCache={props.hasCache}
+        accounts={props.accounts}
+        syncingHint={props.syncingHint}
+        selectedMessageId={props.selectedMessageId}
+        isSelected={props.isSelected}
+        onRowClick={props.onRowClick}
+        onContextMenu={props.onContextMenu}
+        onSelectOnlyForContext={props.onSelectOnlyForContext}
+        onToggleStar={props.onToggleStar}
+      />
     </section>
+  );
+}
+
+function VirtualizedList(props: {
+  messages: MessageMeta[];
+  messagesLoading: boolean;
+  hasCache: boolean;
+  accounts: Account[];
+  syncingHint: boolean;
+  selectedMessageId: string | null;
+  isSelected: (id: string) => boolean;
+  onRowClick: (e: MouseEvent, m: MessageMeta) => void;
+  onContextMenu: (e: MouseEvent, m: MessageMeta) => void;
+  onSelectOnlyForContext: (m: MessageMeta) => void;
+  onToggleStar: (m: MessageMeta) => void;
+}) {
+  let scrollEl: HTMLDivElement | undefined;
+  const [scrollTop, setScrollTop] = createSignal(0);
+  const [viewportH, setViewportH] = createSignal(800);
+  const accountsByEmail = createMemo(() => {
+    const m = new Map<string, Account>();
+    for (const a of props.accounts) m.set(a.email, a);
+    return m;
+  });
+
+  onMount(() => {
+    if (!scrollEl) return;
+    setViewportH(scrollEl.clientHeight);
+    const ro = new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect.height;
+      if (h) setViewportH(h);
+    });
+    ro.observe(scrollEl);
+    onCleanup(() => ro.disconnect());
+  });
+
+  const range = createMemo(() => {
+    const total = props.messages.length;
+    if (total === 0) return { start: 0, end: 0 };
+    const start = Math.max(
+      0,
+      Math.floor(scrollTop() / ROW_HEIGHT_PX) - OVERSCAN_ROWS,
+    );
+    const visible = Math.ceil(viewportH() / ROW_HEIGHT_PX) + OVERSCAN_ROWS * 2;
+    const end = Math.min(total, start + visible);
+    return { start, end };
+  });
+
+  const slice = createMemo(() =>
+    props.messages.slice(range().start, range().end),
+  );
+
+  return (
+    <div
+      ref={(el) => (scrollEl = el)}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+      class="flex-1 overflow-y-auto"
+    >
+      <Show
+        when={
+          !props.messagesLoading &&
+          props.hasCache &&
+          props.messages.length === 0
+        }
+      >
+        <div class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
+          {props.accounts.length === 0
+            ? "Add an account to get started."
+            : props.syncingHint
+              ? "Syncing…"
+              : "No messages."}
+        </div>
+      </Show>
+      <Show when={props.messagesLoading && !props.hasCache}>
+        <div class="px-4 py-8 text-center text-sm text-[color:var(--color-muted)]">
+          Loading…
+        </div>
+      </Show>
+      <Show when={props.messages.length > 0}>
+        <div
+          style={{
+            height: `${props.messages.length * ROW_HEIGHT_PX}px`,
+            position: "relative",
+          }}
+        >
+          <For each={slice()}>
+            {(m, i) => (
+              <MessageRow
+                m={m}
+                active={props.selectedMessageId === m.id}
+                isSelected={props.isSelected(m.id)}
+                accountsByEmail={accountsByEmail()}
+                top={(range().start + i()) * ROW_HEIGHT_PX}
+                height={ROW_HEIGHT_PX}
+                onClick={(e) => props.onRowClick(e, m)}
+                onContextMenu={(e) => {
+                  if (!props.isSelected(m.id)) {
+                    props.onSelectOnlyForContext(m);
+                  }
+                  props.onContextMenu(e, m);
+                }}
+                onToggleStar={() => props.onToggleStar(m)}
+              />
+            )}
+          </For>
+        </div>
+      </Show>
+    </div>
   );
 }
 
@@ -188,19 +282,27 @@ function MessageRow(props: {
   m: MessageMeta;
   active: boolean;
   isSelected: boolean;
-  accounts: Account[];
+  accountsByEmail: Map<string, Account>;
+  top: number;
+  height: number;
   onClick: (e: MouseEvent) => void;
   onContextMenu: (e: MouseEvent) => void;
   onToggleStar: () => void;
 }) {
   const fromParsed = () => parseFromHeader(props.m.from);
-  const acct = () =>
-    props.accounts.find((a) => a.email === props.m.account_email);
+  const acct = () => props.accountsByEmail.get(props.m.account_email);
   const isStarred = () => props.m.label_ids.includes("STARRED");
   return (
-    <li
+    <div
       onClick={props.onClick}
       onContextMenu={props.onContextMenu}
+      style={{
+        position: "absolute",
+        top: `${props.top}px`,
+        left: "0",
+        right: "0",
+        height: `${props.height}px`,
+      }}
       class={`group flex cursor-pointer select-none items-start gap-3 border-b border-[color:var(--color-border)] px-4 py-3 hover:bg-[color:var(--color-surface-hover)] ${
         props.isSelected ? "bg-[color:var(--color-accent-bg)]" : ""
       } ${
@@ -285,6 +387,6 @@ function MessageRow(props: {
           {props.m.snippet}
         </div>
       </div>
-    </li>
+    </div>
   );
 }

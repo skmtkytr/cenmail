@@ -39,11 +39,16 @@ import {
 } from "./types";
 import { ToastContainer, showToast, triggerLastAction } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
-import { settings, notificationsEnabledFor } from "./settings";
+import { settings, notificationsEnabledFor, updateSettings } from "./settings";
 import { SettingsModal } from "./settingsModal";
 import { CalendarPane } from "./calendarPane";
 import { ShortcutsHelpModal } from "./shortcutsHelp";
 import { ContextMenu, type TriageActions } from "./contextMenu";
+import {
+  CommandPalette,
+  useCmdKHotkey,
+  type Command,
+} from "./commandPalette";
 import { ComposeModal } from "./composeModal";
 import { MessagePreview } from "./messagePreview";
 import { MessageList } from "./messageList";
@@ -149,6 +154,26 @@ function App() {
   const [messagesError, setMessagesError] = createSignal<string | null>(null);
 
   const [syncState, setSyncState] = createStore<Record<string, SyncState>>({});
+
+  // Unread badge map: `${email}|${folder}` → count. Refreshed after every
+  // sync:done / messages:changed / snooze:fired (cheap query, indexed).
+  const [unreadCounts, setUnreadCounts] = createSignal<Record<string, number>>(
+    {},
+  );
+  async function refreshUnreadCounts() {
+    try {
+      const rows = await invoke<
+        Array<{ account_email: string; folder: string; count: number }>
+      >("unread_counts");
+      const next: Record<string, number> = {};
+      for (const r of rows) {
+        next[`${r.account_email}|${r.folder}`] = r.count;
+      }
+      setUnreadCounts(next);
+    } catch {
+      // best-effort; leave previous badges
+    }
+  }
 
   const [accounts, { refetch: refetchAccounts }] = createResource<Account[]>(
     async () => await invoke<Account[]>("list_accounts"),
@@ -259,9 +284,26 @@ function App() {
     }
   }
 
-  function reloadAllVisible() {
+  // Invalidate every cached folder/account view. Reserved for events that
+  // could affect every view at once: account added/removed, manual full
+  // refresh, or destructive backend mutations whose blast radius isn't known.
+  function invalidateAllCaches() {
     setMessageCache({});
+  }
+
+  // Refetch only the folder/account/query the user is looking at now. Other
+  // cached folders stay warm until the user navigates to them, where the
+  // foreground sync that brought us here will already have updated the DB.
+  function reloadCurrentList() {
     void loadMessages(selectedAccount(), selectedFolder(), debouncedSearch());
+  }
+
+  // Backwards-compatible helper: wipe everything *and* refetch current. Use
+  // only when we genuinely can't pinpoint the dirty key set (e.g. mute thread
+  // which spans multiple cached folders for the same account).
+  function reloadAllVisible() {
+    invalidateAllCaches();
+    reloadCurrentList();
   }
 
   // Reload the visible list at most once per `LIST_RELOAD_DEBOUNCE_MS` while
@@ -420,6 +462,8 @@ function App() {
   onMount(async () => {
     unlistenFns.push(
       await listen("accounts:changed", async () => {
+        // Account list shifted (add/remove) → every cached account-scoped
+        // view is stale.
         await refetchAccounts();
         reloadAllVisible();
       }),
@@ -439,7 +483,12 @@ function App() {
         setSyncState(email, "fetched", total);
         setSyncState(email, "total", total);
         setSyncState(email, "status", "done");
-        reloadAllVisible();
+        // Sync brought new rows for this account → refresh whatever the user
+        // is looking at, then run the notification pass against the freshly
+        // populated cache.
+        reloadCurrentList();
+        void refreshUnreadCounts();
+        void notifyForRecent();
       }),
     );
     unlistenFns.push(
@@ -451,7 +500,10 @@ function App() {
     );
     unlistenFns.push(
       await listen<string>("snooze:fired", () => {
-        reloadAllVisible();
+        // Snoozed message landed back in Inbox; only the current view needs
+        // a refetch.
+        reloadCurrentList();
+        void refreshUnreadCounts();
       }),
     );
     unlistenFns.push(
@@ -461,8 +513,11 @@ function App() {
     );
     unlistenFns.push(
       await listen<string>("messages:changed", () => {
-        // Backend mutated a message (e.g., timer fired); refresh visible list.
-        reloadAllVisible();
+        // User-initiated mutations apply locally via applyLocalLabelChange
+        // before this event fires, so we only refetch the current view to
+        // pick up changes from the CLI / other windows / timer-fired actions.
+        reloadCurrentList();
+        void refreshUnreadCounts();
       }),
     );
 
@@ -470,6 +525,8 @@ function App() {
     void backfillAccountProfiles();
     // Ensure notification permission is requested early; ignore failure.
     void ensureNotificationPermission();
+    // Seed the sidebar badges before the first sync completes.
+    void refreshUnreadCounts();
     // Start background sync of all accounts on first load.
     void syncAll();
   });
@@ -503,20 +560,20 @@ function App() {
     } catch {}
   }
 
-  // Cross-reference: after a sync settles and the visible cache is reloaded,
-  // notify for any new Personal-bucket unread message we haven't notified for.
+  // Notification pass: fired explicitly after every sync:done. Pulls a fresh
+  // unread/personal list straight from the backend so we don't depend on
+  // which cache key the user happens to be viewing.
   let notifyWarmedUp = false;
-  createEffect(() => {
-    const allKeys = Object.keys(messageCache);
-    if (allKeys.length === 0) return;
+  async function notifyForRecent() {
     const lastSeen = getLastNotifiedMs();
     let maxSeen = lastSeen;
     const candidates: MessageMeta[] = [];
-    for (const key of allKeys) {
-      // Only consider the Inbox caches so we don't pick up sent/archive lists.
-      if (!key.startsWith("inbox:")) continue;
-      const list = messageCache[key] ?? [];
-      for (const m of list) {
+    try {
+      const inbox = await invoke<MessageMeta[]>("list_messages", {
+        folder: "inbox",
+        limit: 200,
+      });
+      for (const m of inbox) {
         if (m.date_millis > maxSeen) maxSeen = m.date_millis;
         if (!m.unread) continue;
         if (m.date_millis <= lastSeen) continue;
@@ -525,9 +582,12 @@ function App() {
         }
         candidates.push(m);
       }
+    } catch {
+      return;
     }
-    // On first observation after launch, swallow the burst — set the watermark
-    // to the latest seen and don't fire any notifications.
+    // First post-launch pass: swallow the inbox snapshot rather than
+    // notifying for every existing unread; record the high-water mark and
+    // bail.
     if (!notifyWarmedUp) {
       notifyWarmedUp = true;
       if (maxSeen > lastSeen) setLastNotifiedMs(maxSeen);
@@ -535,22 +595,21 @@ function App() {
     }
     if (candidates.length === 0) return;
     if (maxSeen > lastSeen) setLastNotifiedMs(maxSeen);
-    void ensureNotificationPermission().then((granted) => {
-      if (!granted) return;
-      if (candidates.length === 1) {
-        const m = candidates[0];
-        sendNotification({
-          title: parseFromHeader(m.from).name,
-          body: m.subject || "(no subject)",
-        });
-      } else {
-        sendNotification({
-          title: "cenmail",
-          body: `${candidates.length} new messages`,
-        });
-      }
-    });
-  });
+    const granted = await ensureNotificationPermission();
+    if (!granted) return;
+    if (candidates.length === 1) {
+      const m = candidates[0];
+      sendNotification({
+        title: parseFromHeader(m.from).name,
+        body: m.subject || "(no subject)",
+      });
+    } else {
+      sendNotification({
+        title: "cenmail",
+        body: `${candidates.length} new messages`,
+      });
+    }
+  }
 
   async function backfillAccountProfiles() {
     await refetchAccounts();
@@ -650,7 +709,9 @@ function App() {
   function archiveWithUndo(targets: MessageMeta[]) {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
+    const next = pickAutoAdvance(targets);
     for (const t of targets) void modifyLabels(t, [], ["INBOX"]);
+    if (next && !selectedMessageId()) void selectMessage(next);
     showToast({
       message: targets.length === 1 ? "Archived" : `Archived ${targets.length}`,
       action: {
@@ -666,7 +727,9 @@ function App() {
   function trashWithUndo(targets: MessageMeta[]) {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
+    const next = pickAutoAdvance(targets);
     for (const t of targets) void trashMessageAction(t);
+    if (next && !selectedMessageId()) void selectMessage(next);
     showToast({
       message:
         targets.length === 1
@@ -683,6 +746,7 @@ function App() {
 
   async function snoozeMessages(targets: MessageMeta[], fireAtMs: number) {
     if (targets.length === 0) return;
+    const next = pickAutoAdvance(targets);
     for (const t of targets) {
       // Optimistic: remove from current cache so it disappears immediately.
       applyLocalLabelChange(t, [], ["INBOX"]);
@@ -701,6 +765,7 @@ function App() {
         return;
       }
     }
+    if (next && !selectedMessageId()) void selectMessage(next);
     const when = new Date(fireAtMs);
     const label =
       targets.length === 1
@@ -757,6 +822,7 @@ function App() {
   function spamWithUndo(targets: MessageMeta[]) {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
+    const next = pickAutoAdvance(targets);
     for (const t of targets) {
       applyLocalLabelChange(t, ["SPAM"], ["INBOX", "UNREAD"]);
       void invoke("modify_message", {
@@ -769,6 +835,7 @@ function App() {
         reloadAllVisible();
       });
     }
+    if (next && !selectedMessageId()) void selectMessage(next);
     showToast({
       message:
         snapshot.length === 1
@@ -832,6 +899,30 @@ function App() {
         },
       },
     });
+  }
+
+  // After bulk archive / trash / snooze / mute / spam, pick the message we
+  // should jump to so the preview never goes empty. Prefers the row right
+  // after the last target; falls back to the row right before the first.
+  function pickAutoAdvance(targets: MessageMeta[]): MessageMeta | null {
+    const list = visibleMessages() ?? [];
+    if (targets.length === 0 || list.length === 0) return null;
+    const ids = new Set(targets.map((t) => t.id));
+    let firstIdx = list.length;
+    let lastIdx = -1;
+    for (let i = 0; i < list.length; i++) {
+      if (!ids.has(list[i].id)) continue;
+      if (i < firstIdx) firstIdx = i;
+      if (i > lastIdx) lastIdx = i;
+    }
+    if (lastIdx < 0) return null;
+    for (let i = lastIdx + 1; i < list.length; i++) {
+      if (!ids.has(list[i].id)) return list[i];
+    }
+    for (let i = firstIdx - 1; i >= 0; i--) {
+      if (!ids.has(list[i].id)) return list[i];
+    }
+    return null;
   }
 
   function applyLocalLabelChange(
@@ -972,6 +1063,8 @@ function App() {
           bcc: extractEmailAddresses(cur.bcc),
           subject: cur.subject,
           body: cur.body,
+          htmlBody: cur.html_body ?? null,
+          attachments: cur.attachments ?? [],
           inReplyTo: cur.in_reply_to,
           references: cur.references,
         },
@@ -986,8 +1079,9 @@ function App() {
     }
   }
 
-  // Autosave: only persist blank composes (reply / forward composes are
-  // initiated from a specific message and shouldn't survive across sessions).
+  // Local autosave: keep the current compose around in localStorage so a
+  // crash / window close restores it. Server-side autosave below handles
+  // cross-device persistence via Gmail Drafts.
   createEffect(() => {
     const cur = compose();
     if (!cur) return;
@@ -995,6 +1089,75 @@ function App() {
     try {
       localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(cur));
     } catch {}
+  });
+
+  // Debounced Gmail Drafts autosave: 1.5s after the compose state stops
+  // changing, push the current draft to Gmail. The first save creates a
+  // draft and stashes its id back into compose state; subsequent saves
+  // update in place.
+  let draftSaveTimer: number | undefined;
+  let draftSaveInflight = false;
+  function scheduleDraftSave() {
+    if (draftSaveTimer !== undefined) clearTimeout(draftSaveTimer);
+    draftSaveTimer = window.setTimeout(saveDraftNow, 1500);
+  }
+  async function saveDraftNow() {
+    const cur = compose();
+    if (!cur) return;
+    if (draftSaveInflight) {
+      // A save is already in flight; reschedule once it lands so we never
+      // drop the latest edits.
+      scheduleDraftSave();
+      return;
+    }
+    if (isComposeEmpty(cur)) return;
+    if (!cur.from_account) return;
+    draftSaveInflight = true;
+    try {
+      const id = await invoke<string>("save_draft", {
+        request: {
+          draftId: cur.draft_id ?? null,
+          fromAccount: cur.from_account,
+          to: extractEmailAddresses(cur.to),
+          cc: extractEmailAddresses(cur.cc),
+          bcc: extractEmailAddresses(cur.bcc),
+          subject: cur.subject,
+          body: cur.body,
+          htmlBody: cur.html_body ?? null,
+          attachments: cur.attachments ?? [],
+          inReplyTo: cur.in_reply_to,
+          references: cur.references,
+        },
+      });
+      if (!cur.draft_id) {
+        const latest = compose();
+        if (latest) setCompose({ ...latest, draft_id: id });
+      }
+    } catch (err) {
+      // Surface only the first failure so we don't spam the user on every
+      // keystroke when offline. Tracks a small per-session signal.
+      if (!draftSaveErrorShown) {
+        showToast({
+          message: `Draft autosave failed: ${err}`,
+          variant: "error",
+        });
+        draftSaveErrorShown = true;
+      }
+    } finally {
+      draftSaveInflight = false;
+    }
+  }
+  let draftSaveErrorShown = false;
+
+  createEffect(() => {
+    const cur = compose();
+    if (!cur) return;
+    // Skip server autosave for replies/forwards (the user usually wants the
+    // draft local until they actually send) and for empty composes.
+    if (cur.in_reply_to) return;
+    if (cur.subject.startsWith("Fwd:")) return;
+    if (isComposeEmpty(cur)) return;
+    scheduleDraftSave();
   });
 
   function defaultFromAccount(): string {
@@ -1042,8 +1205,21 @@ function App() {
       c.cc.trim() === "" &&
       c.bcc.trim() === "" &&
       c.subject.trim() === "" &&
-      c.body.trim() === ""
+      c.body.trim() === "" &&
+      (c.attachments ?? []).length === 0 &&
+      (c.html_body ?? "").trim() === ""
     );
+  }
+
+  function signatureFor(email: string): string {
+    return settings().compose.signatures[email] ?? "";
+  }
+  // Append the per-account signature to a fresh body. We never auto-append
+  // to replies/forwards — those already carry the quoted history and the
+  // signature would land in an awkward spot.
+  function bodyWithSignature(account: string): string {
+    const sig = signatureFor(account);
+    return sig ? `\n\n--\n${sig}` : "";
   }
 
   function openCompose() {
@@ -1054,16 +1230,19 @@ function App() {
       showToast({ message: "Draft restored" });
       return;
     }
+    const acct = defaultFromAccount();
     setCompose({
-      from_account: defaultFromAccount(),
+      from_account: acct,
       to: "",
       cc: "",
       bcc: "",
       subject: "",
-      body: "",
+      body: bodyWithSignature(acct),
       in_reply_to: null,
       references: null,
       show_cc_bcc: false,
+      rich: settings().compose.richTextDefault,
+      attachments: [],
     });
   }
 
@@ -1101,6 +1280,8 @@ function App() {
       in_reply_to: detail.message_id_header || null,
       references: refs || null,
       show_cc_bcc: ccList.length > 0,
+      rich: false,
+      attachments: [],
     });
   }
 
@@ -1122,6 +1303,8 @@ function App() {
       in_reply_to: null,
       references: null,
       show_cc_bcc: false,
+      rich: false,
+      attachments: [],
     });
   }
 
@@ -1135,6 +1318,14 @@ function App() {
         destructive: true,
       });
       if (!ok) return;
+      // Discard also removes the server-side Gmail draft so it doesn't
+      // linger in the Drafts folder. Best-effort: silently ignore failures.
+      if (cur.draft_id) {
+        void invoke("delete_draft", {
+          email: cur.from_account,
+          draftId: cur.draft_id,
+        }).catch(() => {});
+      }
     }
     clearDraft();
     setCompose(null);
@@ -1153,18 +1344,26 @@ function App() {
   let pendingSendPayload: ComposeState | null = null;
 
   function fireSend(payload: ComposeState) {
-    invoke("send_message", {
-      request: {
-        fromAccount: payload.from_account,
-        to: extractEmailAddresses(payload.to),
-        cc: extractEmailAddresses(payload.cc),
-        bcc: extractEmailAddresses(payload.bcc),
-        subject: payload.subject,
-        body: payload.body,
-        inReplyTo: payload.in_reply_to,
-        references: payload.references,
-      },
-    })
+    const send = payload.draft_id
+      ? invoke("send_draft", {
+          email: payload.from_account,
+          draftId: payload.draft_id,
+        })
+      : invoke("send_message", {
+          request: {
+            fromAccount: payload.from_account,
+            to: extractEmailAddresses(payload.to),
+            cc: extractEmailAddresses(payload.cc),
+            bcc: extractEmailAddresses(payload.bcc),
+            subject: payload.subject,
+            body: payload.body,
+            htmlBody: payload.html_body ?? null,
+            attachments: payload.attachments ?? [],
+            inReplyTo: payload.in_reply_to,
+            references: payload.references,
+          },
+        });
+    send
       .then(() => showToast({ message: "Sent" }))
       .catch((err) =>
         showToast({ message: `Send failed: ${err}`, variant: "error" }),
@@ -1264,6 +1463,184 @@ function App() {
   };
 
   const [showShortcuts, setShowShortcuts] = createSignal(false);
+  const [paletteOpen, setPaletteOpen] = createSignal(false);
+  useCmdKHotkey(() => setPaletteOpen((v) => !v));
+
+  // Build the palette command list from current state on each open. Cheap
+  // because Solid only recomputes when the dependencies actually change.
+  const paletteCommands = createMemo<Command[]>(() => {
+    const m = currentMessage();
+    const cmds: Command[] = [
+      {
+        id: "compose",
+        label: "Compose new message",
+        group: "Mail",
+        hint: "c",
+        keywords: ["new", "write", "mail"],
+        run: openCompose,
+      },
+      {
+        id: "sync-now",
+        label: "Sync now",
+        group: "Mail",
+        hint: "Ctrl+Shift+R",
+        keywords: ["refresh", "fetch", "reload"],
+        run: handleRefresh,
+      },
+      {
+        id: "view-mail",
+        label: "Switch to Mail view",
+        group: "View",
+        hint: "Ctrl+Shift+1",
+        run: () => setViewMode("mail"),
+      },
+      {
+        id: "view-cal",
+        label: "Switch to Calendar view",
+        group: "View",
+        hint: "Ctrl+Shift+2",
+        run: () => setViewMode("calendar"),
+      },
+      {
+        id: "open-settings",
+        label: "Open settings",
+        group: "App",
+        keywords: ["preferences", "options"],
+        run: () => setSettingsOpen(true),
+      },
+      {
+        id: "open-shortcuts",
+        label: "Show keyboard shortcuts",
+        group: "App",
+        hint: "?",
+        run: () => setShowShortcuts(true),
+      },
+    ];
+    // Folder switches
+    for (const f of folders) {
+      cmds.push({
+        id: `folder-${f.id}`,
+        label: `Go to ${f.label}`,
+        group: "Folder",
+        keywords: [f.id, "folder", "switch"],
+        run: () => {
+          setViewMode("mail");
+          setSelectedFolder(f.id);
+        },
+      });
+    }
+    // Account switches
+    cmds.push({
+      id: "acct-all",
+      label: "Show All Inboxes",
+      group: "Account",
+      keywords: ["all", "everyone", "merged"],
+      run: () => setSelectedAccount("all"),
+    });
+    for (const a of accounts() ?? []) {
+      cmds.push({
+        id: `acct-${a.id}`,
+        label: `Switch to ${a.email}`,
+        group: "Account",
+        keywords: ["account", a.email],
+        run: () => setSelectedAccount(a.id),
+      });
+    }
+    // Theme toggles
+    for (const t of ["system", "light", "dark"] as const) {
+      cmds.push({
+        id: `theme-${t}`,
+        label: `Theme: ${t.charAt(0).toUpperCase() + t.slice(1)}`,
+        group: "Theme",
+        run: () =>
+          updateSettings((s) => ({
+            ...s,
+            appearance: { ...s.appearance, theme: t },
+          })),
+      });
+    }
+    // Message-scoped actions (only when something is selected)
+    if (m) {
+      const sel = m;
+      cmds.push({
+        id: "msg-archive",
+        label: "Archive selected",
+        group: "Triage",
+        hint: "e",
+        run: () => archiveWithUndo([sel]),
+      });
+      cmds.push({
+        id: "msg-trash",
+        label: "Move selected to Trash",
+        group: "Triage",
+        hint: "#",
+        run: () => trashWithUndo([sel]),
+      });
+      cmds.push({
+        id: "msg-star",
+        label: sel.label_ids.includes("STARRED")
+          ? "Unstar selected"
+          : "Star selected",
+        group: "Triage",
+        hint: "s",
+        run: () => starToggleWithUndo([sel]),
+      });
+      cmds.push({
+        id: "msg-read",
+        label: sel.unread ? "Mark as read" : "Mark as unread",
+        group: "Triage",
+        hint: "u",
+        run: () => {
+          if (sel.unread) void modifyLabels(sel, [], ["UNREAD"]);
+          else void modifyLabels(sel, ["UNREAD"], []);
+        },
+      });
+      cmds.push({
+        id: "msg-snooze-1h",
+        label: "Snooze selected for 1 hour",
+        group: "Triage",
+        hint: "z",
+        run: () => void snoozeMessages([sel], snoozePresets()[0].fireAt),
+      });
+      cmds.push({
+        id: "msg-mute",
+        label: "Mute thread",
+        group: "Triage",
+        hint: "m",
+        run: () => void muteThreadAction(sel),
+      });
+      cmds.push({
+        id: "msg-spam",
+        label: "Mark as spam",
+        group: "Triage",
+        run: () => spamWithUndo([sel]),
+      });
+      if (messageDetail()) {
+        cmds.push({
+          id: "msg-reply",
+          label: "Reply",
+          group: "Reply",
+          hint: "r",
+          run: () => openReply(false),
+        });
+        cmds.push({
+          id: "msg-reply-all",
+          label: "Reply all",
+          group: "Reply",
+          hint: "a",
+          run: () => openReply(true),
+        });
+        cmds.push({
+          id: "msg-forward",
+          label: "Forward",
+          group: "Reply",
+          hint: "f",
+          run: openForward,
+        });
+      }
+    }
+    return cmds;
+  });
 
   function currentMessage(): MessageMeta | null {
     const id = selectedMessageId();
@@ -1520,6 +1897,7 @@ function App() {
         aggregateSync={aggregateSync() ?? null}
         addingAccount={addingAccount()}
         addError={addError()}
+        unreadCounts={unreadCounts()}
         onAddAccount={handleAddAccount}
         onRemoveAccount={handleRemoveAccount}
         onCompose={openCompose}
@@ -1603,6 +1981,12 @@ function App() {
       />
 
       <ShortcutsHelpModal open={showShortcuts()} onClose={() => setShowShortcuts(false)} />
+
+      <CommandPalette
+        open={paletteOpen()}
+        commands={paletteCommands()}
+        onClose={() => setPaletteOpen(false)}
+      />
 
 
       <ComposeModal

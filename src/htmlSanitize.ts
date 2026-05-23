@@ -1,6 +1,10 @@
 export type SanitizeOptions = {
   allowRemoteImages: boolean;
   dark: boolean;
+  /// Map of `Content-Id` (without the surrounding `<>`) to a `data:` URL
+  /// containing the attachment bytes. Used to inline `cid:` images that
+  /// would otherwise show as broken placeholders.
+  cidMap?: Record<string, string>;
 };
 
 export type SanitizeResult = {
@@ -23,6 +27,16 @@ function isLocalImageSrc(src: string): boolean {
   return trimmed.startsWith("data:") || trimmed.startsWith("cid:");
 }
 
+// Resolve a single `cid:` reference using the supplied map. Returns the
+// resolved data: URL if found, else null (caller decides whether to drop the
+// img or leave the cid as-is).
+function resolveCid(src: string, map: Record<string, string>): string | null {
+  const trimmed = src.trim();
+  if (!trimmed.toLowerCase().startsWith("cid:")) return null;
+  const id = trimmed.slice(4).trim();
+  return map[id] ?? null;
+}
+
 function isSafeHref(href: string): boolean {
   const trimmed = href.trim().toLowerCase();
   if (trimmed.startsWith("javascript:")) return false;
@@ -42,10 +56,14 @@ export function sanitizeMessageHtml(
     "text/html",
   );
 
-  // Drop scripts entirely.
-  doc.querySelectorAll("script, noscript, meta[http-equiv], iframe, object, embed").forEach(
-    (el) => el.remove(),
-  );
+  // Drop scripts entirely. `<base>` is also pulled out because it can rewrite
+  // relative URLs to point at an attacker's origin; `<link>` and `<style>`
+  // can pull remote resources via @import or url() during render.
+  doc
+    .querySelectorAll(
+      "script, noscript, meta[http-equiv], iframe, object, embed, base, link",
+    )
+    .forEach((el) => el.remove());
 
   // Strip every on* event handler.
   doc.querySelectorAll("*").forEach((el) => {
@@ -57,13 +75,22 @@ export function sanitizeMessageHtml(
   });
 
   let blocked = 0;
+  const cidMap = opts.cidMap ?? {};
+
+  // Step 1: resolve any `cid:` images we have data for. Runs whether or not
+  // remote images are allowed since CIDs are part of the message itself.
+  doc.querySelectorAll("img").forEach((img) => {
+    const src = img.getAttribute("src") ?? "";
+    const resolved = resolveCid(src, cidMap);
+    if (resolved) img.setAttribute("src", resolved);
+  });
 
   if (!opts.allowRemoteImages) {
     doc.querySelectorAll("img").forEach((img) => {
       const src = img.getAttribute("src") ?? "";
       const srcset = img.getAttribute("srcset") ?? "";
       let hasRemote = false;
-      if (src && !isLocalImageSrc(src)) {
+      if (src && !isLocalImageSrc(src) && !src.startsWith("data:")) {
         img.setAttribute("data-cenmail-src", src);
         img.setAttribute("src", "");
         hasRemote = true;

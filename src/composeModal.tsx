@@ -1,7 +1,45 @@
 import { For, Show, createSignal } from "solid-js";
-import type { Account, ComposeState } from "./types";
+import type { Account, ComposeAttachment, ComposeState } from "./types";
 import { snoozePresets } from "./types";
 import { useEscClose } from "./modal";
+
+const ATTACHMENT_LIMIT_MB = 25;
+
+function fileToB64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string") {
+        reject(new Error("FileReader returned non-string"));
+        return;
+      }
+      // result is "data:<mime>;base64,<b64>" — strip the prefix.
+      const idx = result.indexOf(",");
+      resolve(idx >= 0 ? result.slice(idx + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+function stripHtmlForFallback(html: string): string {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return (div.textContent ?? "").replace(/ /g, " ");
+}
 
 export function ComposeModal(props: {
   compose: ComposeState | null;
@@ -13,7 +51,59 @@ export function ComposeModal(props: {
   onUpdate: <K extends keyof ComposeState>(key: K, value: ComposeState[K]) => void;
 }) {
   const [scheduleMenuOpen, setScheduleMenuOpen] = createSignal(false);
+  const [attachError, setAttachError] = createSignal<string | null>(null);
   useEscClose(() => props.compose !== null, () => props.onClose());
+
+  async function addFiles(files: FileList | File[]) {
+    setAttachError(null);
+    const cur = props.compose;
+    if (!cur) return;
+    const existing = cur.attachments ?? [];
+    const currentBytes = existing.reduce((s, a) => s + a.size, 0);
+    const limitBytes = ATTACHMENT_LIMIT_MB * 1024 * 1024;
+    const next: ComposeAttachment[] = [...existing];
+    let totalBytes = currentBytes;
+    for (const f of Array.from(files)) {
+      if (totalBytes + f.size > limitBytes) {
+        setAttachError(
+          `Attachments would exceed Gmail's ${ATTACHMENT_LIMIT_MB} MB limit.`,
+        );
+        break;
+      }
+      try {
+        const b64 = await fileToB64(f);
+        next.push({
+          filename: f.name,
+          mime_type: f.type || "application/octet-stream",
+          size: f.size,
+          data_b64: b64,
+        });
+        totalBytes += f.size;
+      } catch (err) {
+        setAttachError(`Failed to read ${f.name}: ${err}`);
+      }
+    }
+    props.onUpdate("attachments", next);
+  }
+
+  function removeAttachment(idx: number) {
+    const cur = props.compose;
+    if (!cur) return;
+    const next = (cur.attachments ?? []).filter((_, i) => i !== idx);
+    props.onUpdate("attachments", next);
+  }
+
+  function applyFormat(cmd: "bold" | "italic" | "createLink" | "formatBlock") {
+    if (cmd === "createLink") {
+      const url = window.prompt("Link URL?");
+      if (!url) return;
+      document.execCommand("createLink", false, url);
+    } else if (cmd === "formatBlock") {
+      document.execCommand("formatBlock", false, "blockquote");
+    } else {
+      document.execCommand(cmd);
+    }
+  }
   return (
     <Show when={props.compose}>
       {(cs) => (
@@ -123,20 +213,163 @@ export function ComposeModal(props: {
               />
             </div>
 
-            <textarea
-              value={cs().body}
-              onInput={(e) => props.onUpdate("body", e.currentTarget.value)}
-              placeholder="Write your message…"
-              class="flex-1 resize-none bg-transparent p-4 text-sm leading-relaxed outline-none"
-            />
+            <Show when={cs().rich}>
+              <div class="flex shrink-0 items-center gap-1 border-b border-[color:var(--color-border)] px-2 py-1 text-xs text-[color:var(--color-muted)]">
+                <button
+                  type="button"
+                  title="Bold (Ctrl+B)"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyFormat("bold");
+                  }}
+                  class="rounded px-2 py-0.5 font-bold hover:bg-[color:var(--color-surface-hover)]"
+                >
+                  B
+                </button>
+                <button
+                  type="button"
+                  title="Italic (Ctrl+I)"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyFormat("italic");
+                  }}
+                  class="rounded px-2 py-0.5 italic hover:bg-[color:var(--color-surface-hover)]"
+                >
+                  I
+                </button>
+                <button
+                  type="button"
+                  title="Insert link"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyFormat("createLink");
+                  }}
+                  class="rounded px-2 py-0.5 hover:bg-[color:var(--color-surface-hover)]"
+                >
+                  🔗
+                </button>
+                <button
+                  type="button"
+                  title="Block quote"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyFormat("formatBlock");
+                  }}
+                  class="rounded px-2 py-0.5 hover:bg-[color:var(--color-surface-hover)]"
+                >
+                  ❝
+                </button>
+                <span class="ml-auto">
+                  <button
+                    type="button"
+                    title="Switch to plain text"
+                    onClick={() => {
+                      // Drop HTML, keep text content.
+                      const text = stripHtmlForFallback(cs().html_body ?? "");
+                      props.onUpdate("body", text || cs().body);
+                      props.onUpdate("html_body", undefined);
+                      props.onUpdate("rich", false);
+                    }}
+                    class="text-[10px] uppercase tracking-wide hover:text-[color:var(--color-fg)]"
+                  >
+                    Plain
+                  </button>
+                </span>
+              </div>
+              <div
+                contentEditable
+                class="flex-1 overflow-auto bg-transparent p-4 text-sm leading-relaxed outline-none"
+                ref={(el) => {
+                  // Only seed the DOM when html_body is non-empty; otherwise
+                  // typing into an empty div is fine without an initial value.
+                  if (el && cs().html_body && el.innerHTML === "") {
+                    el.innerHTML = cs().html_body ?? "";
+                  }
+                }}
+                onInput={(e) => {
+                  const html = (e.currentTarget as HTMLDivElement).innerHTML;
+                  props.onUpdate("html_body", html);
+                  props.onUpdate("body", stripHtmlForFallback(html));
+                }}
+              />
+            </Show>
+            <Show when={!cs().rich}>
+              <div class="flex shrink-0 items-center justify-end gap-2 border-b border-[color:var(--color-border)] px-2 py-1 text-xs text-[color:var(--color-muted)]">
+                <button
+                  type="button"
+                  title="Switch to rich text"
+                  onClick={() => {
+                    if (!cs().html_body) {
+                      // Promote the current plain body to HTML by escaping &
+                      // wrapping linebreaks.
+                      const seed = (cs().body || "")
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/\n/g, "<br>");
+                      props.onUpdate("html_body", seed);
+                    }
+                    props.onUpdate("rich", true);
+                  }}
+                  class="text-[10px] uppercase tracking-wide hover:text-[color:var(--color-fg)]"
+                >
+                  Rich text
+                </button>
+              </div>
+              <textarea
+                value={cs().body}
+                onInput={(e) => props.onUpdate("body", e.currentTarget.value)}
+                placeholder="Write your message…"
+                class="flex-1 resize-none bg-transparent p-4 text-sm leading-relaxed outline-none"
+              />
+            </Show>
 
-            <Show when={props.sendError}>
+            <Show when={(cs().attachments ?? []).length > 0}>
+              <div class="flex shrink-0 flex-wrap gap-1.5 border-t border-[color:var(--color-border)] px-4 py-2 text-xs">
+                <For each={cs().attachments ?? []}>
+                  {(att, idx) => (
+                    <span class="flex items-center gap-1.5 rounded border border-[color:var(--color-border)] bg-[color:var(--color-bg)] px-2 py-1">
+                      <span aria-hidden="true">📎</span>
+                      <span class="max-w-48 truncate font-medium">
+                        {att.filename}
+                      </span>
+                      <span class="text-[color:var(--color-muted)]">
+                        {formatBytes(att.size)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeAttachment(idx())}
+                        aria-label={`Remove ${att.filename}`}
+                        class="ml-1 text-[color:var(--color-muted)] hover:text-red-500"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  )}
+                </For>
+              </div>
+            </Show>
+
+            <Show when={attachError() || props.sendError}>
               <div class="mx-4 mb-2 rounded border border-red-400 bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-950 dark:text-red-200">
-                {props.sendError}
+                {attachError() ?? props.sendError}
               </div>
             </Show>
 
             <footer class="flex items-center justify-end gap-2 border-t border-[color:var(--color-border)] px-4 py-3">
+              <label class="cursor-pointer rounded border border-[color:var(--color-border)] px-3 py-1.5 text-sm hover:bg-[color:var(--color-surface-hover)]">
+                📎 Attach
+                <input
+                  type="file"
+                  multiple
+                  class="hidden"
+                  onChange={(e) => {
+                    const fl = e.currentTarget.files;
+                    if (fl && fl.length > 0) void addFiles(fl);
+                    e.currentTarget.value = "";
+                  }}
+                />
+              </label>
               <div class="relative mr-auto">
                 <button
                   type="button"

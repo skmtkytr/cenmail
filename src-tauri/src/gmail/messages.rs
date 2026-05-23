@@ -31,15 +31,24 @@ pub struct RawMessage {
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagePart {
+    #[serde(default)]
+    pub part_id: Option<String>,
     pub mime_type: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
     pub headers: Option<Vec<Header>>,
     pub body: Option<MessageBody>,
     pub parts: Option<Vec<MessagePart>>,
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageBody {
     pub data: Option<String>,
+    #[serde(default)]
+    pub attachment_id: Option<String>,
+    #[serde(default)]
+    pub size: Option<i64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -59,6 +68,26 @@ pub struct MessageMeta {
     pub unread: bool,
     pub label_ids: Vec<String>,
     pub account_email: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Attachment {
+    /// Stable across a single message — used for debugging.
+    pub part_id: String,
+    /// Opaque handle Gmail wants in `users.messages.attachments.get`.
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: i64,
+    /// `Content-Id` header value (with surrounding `<>` stripped). Set when
+    /// the part is referenced by a `cid:` URL in the HTML body.
+    #[serde(default)]
+    pub content_id: Option<String>,
+    /// `true` when the part is referenced inline (CID) rather than dangling
+    /// as a regular attachment. The UI uses this to skip CID-only parts from
+    /// the attachment chip strip.
+    #[serde(default)]
+    pub inline: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -82,6 +111,155 @@ pub struct MessageDetail {
     /// UID: line value — useful to match against Google Calendar event ids.
     #[serde(default)]
     pub calendar_uid: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailProfile {
+    #[serde(default)]
+    pub email_address: Option<String>,
+    /// Stringified u64; we parse on the caller side to keep this struct
+    /// schema-faithful.
+    #[serde(default)]
+    pub history_id: Option<String>,
+}
+
+/// `users.getProfile` — primarily used to learn the current historyId so the
+/// next sync can switch to history.list.
+pub async fn fetch_profile(http: &Client, access_token: &str) -> Result<GmailProfile> {
+    let url = format!("{BASE}/users/me/profile");
+    Ok(http
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("profile request")?
+        .error_for_status()
+        .context("profile status")?
+        .json::<GmailProfile>()
+        .await
+        .context("parse profile")?)
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessage {
+    pub id: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub label_ids: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessageAdded {
+    pub message: HistoryMessage,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessageDeleted {
+    pub message: HistoryMessage,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryLabelChange {
+    pub message: HistoryMessage,
+    #[serde(default)]
+    pub label_ids: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRecord {
+    pub id: String,
+    #[serde(default)]
+    pub messages_added: Vec<HistoryMessageAdded>,
+    #[serde(default)]
+    pub messages_deleted: Vec<HistoryMessageDeleted>,
+    #[serde(default)]
+    pub labels_added: Vec<HistoryLabelChange>,
+    #[serde(default)]
+    pub labels_removed: Vec<HistoryLabelChange>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct HistoryPage {
+    #[serde(default)]
+    history: Vec<HistoryRecord>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    history_id: Option<String>,
+}
+
+/// Outcome of `fetch_history`. `Synced` carries the new historyId watermark
+/// plus all records to apply. `Expired` means the start id was too old
+/// (Gmail typically keeps ~7 days) — caller must bootstrap from scratch.
+#[derive(Debug)]
+pub enum HistoryOutcome {
+    Synced {
+        latest_history_id: Option<u64>,
+        records: Vec<HistoryRecord>,
+    },
+    Expired,
+}
+
+/// Fetch all history records since `start_history_id`. Pages through every
+/// `pageToken` until the response stops returning one. Returns
+/// `HistoryOutcome::Expired` if Gmail responds 404 / 410 (start id GC'd).
+pub async fn fetch_history(
+    http: &Client,
+    access_token: &str,
+    start_history_id: u64,
+) -> Result<HistoryOutcome> {
+    let mut records: Vec<HistoryRecord> = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut latest_id: Option<u64> = None;
+    loop {
+        let mut url = format!(
+            "{BASE}/users/me/history?startHistoryId={start_history_id}&maxResults=500"
+        );
+        if let Some(t) = &page_token {
+            url.push_str("&pageToken=");
+            url.push_str(t);
+        }
+        let resp = http
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("history.list request")?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::GONE
+        {
+            return Ok(HistoryOutcome::Expired);
+        }
+        let page: HistoryPage = resp
+            .error_for_status()
+            .context("history.list status")?
+            .json()
+            .await
+            .context("parse history.list")?;
+        if let Some(id) = page.history_id.as_deref().and_then(|s| s.parse().ok()) {
+            latest_id = Some(id);
+        }
+        records.extend(page.history);
+        match page.next_page_token {
+            Some(t) if !t.is_empty() => page_token = Some(t),
+            _ => break,
+        }
+    }
+    Ok(HistoryOutcome::Synced {
+        latest_history_id: latest_id,
+        records,
+    })
 }
 
 pub async fn list_message_ids(
@@ -237,6 +415,42 @@ pub async fn fetch_full(
         .await
         .context("parse messages.get")?;
 
+    Ok(raw_to_detail(raw))
+}
+
+#[derive(Deserialize)]
+struct ThreadResponse {
+    messages: Option<Vec<RawMessage>>,
+}
+
+/// Fetch the entire thread in one request. Returns each message in delivery
+/// order (Gmail returns them oldest-first, which is what the UI wants).
+pub async fn fetch_thread_full(
+    http: &Client,
+    access_token: &str,
+    thread_id: &str,
+) -> Result<Vec<MessageDetail>> {
+    let url = format!("{BASE}/users/me/threads/{thread_id}?format=full");
+    let resp = http
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("threads.get request")?
+        .error_for_status()
+        .context("threads.get status")?
+        .json::<ThreadResponse>()
+        .await
+        .context("parse threads.get")?;
+    Ok(resp
+        .messages
+        .unwrap_or_default()
+        .into_iter()
+        .map(raw_to_detail)
+        .collect())
+}
+
+fn raw_to_detail(raw: RawMessage) -> MessageDetail {
     let payload = raw.payload.clone();
     let header = |name: &str| -> String {
         payload
@@ -257,8 +471,16 @@ pub async fn fetch_full(
         Some(ics) => (extract_ics_line(ics, "METHOD"), extract_ics_line(ics, "UID")),
         None => (None, None),
     };
+    let attachments = match payload.as_ref() {
+        Some(p) => {
+            let mut out = Vec::new();
+            collect_attachments(p, &mut out);
+            out
+        }
+        None => Vec::new(),
+    };
 
-    Ok(MessageDetail {
+    MessageDetail {
         id: raw.id,
         thread_id: raw.thread_id,
         from: header("From"),
@@ -273,7 +495,86 @@ pub async fn fetch_full(
         calendar_body,
         calendar_method,
         calendar_uid,
-    })
+        attachments,
+    }
+}
+
+/// Recursively collect every part with an `attachmentId` (i.e. parts whose
+/// bytes live behind the dedicated `users.messages.attachments.get` endpoint
+/// rather than inline in the payload).
+fn collect_attachments(part: &MessagePart, out: &mut Vec<Attachment>) {
+    let body = part.body.as_ref();
+    let attachment_id = body.and_then(|b| b.attachment_id.clone());
+    if let Some(aid) = attachment_id {
+        let headers = part.headers.as_deref().unwrap_or(&[]);
+        let content_id = headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("Content-Id"))
+            .map(|h| h.value.trim().trim_matches('<').trim_matches('>').to_string());
+        let disposition = headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("Content-Disposition"))
+            .map(|h| h.value.to_ascii_lowercase());
+        let inline = disposition
+            .as_deref()
+            .map(|d| d.starts_with("inline"))
+            .unwrap_or(false)
+            || content_id.is_some();
+        out.push(Attachment {
+            part_id: part.part_id.clone().unwrap_or_default(),
+            attachment_id: aid,
+            filename: part.filename.clone().unwrap_or_default(),
+            mime_type: part.mime_type.clone().unwrap_or_default(),
+            size: body.and_then(|b| b.size).unwrap_or(0),
+            content_id,
+            inline,
+        });
+    }
+    if let Some(parts) = &part.parts {
+        for sub in parts {
+            collect_attachments(sub, out);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AttachmentResponse {
+    data: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    size: Option<i64>,
+}
+
+/// Fetch raw bytes for an attachment. Returned as the standard base64 form
+/// (no URL-safe alphabet, no padding stripped) so the frontend can hand it
+/// straight to `atob`.
+pub async fn fetch_attachment(
+    http: &Client,
+    access_token: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> Result<String> {
+    let url = format!(
+        "{BASE}/users/me/messages/{message_id}/attachments/{attachment_id}"
+    );
+    let resp: AttachmentResponse = http
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("attachment request")?
+        .error_for_status()
+        .context("attachment status")?
+        .json()
+        .await
+        .context("parse attachment")?;
+    // Gmail returns URL-safe base64 without padding; normalise to standard
+    // base64 with padding so the frontend can decode with `atob`.
+    let mut padded = resp.data.replace('-', "+").replace('_', "/");
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    Ok(padded)
 }
 
 fn extract_ics_line(ics: &str, name: &str) -> Option<String> {
@@ -387,10 +688,14 @@ mod tests {
 
     fn part(mime: &str, data: Option<&str>, children: Vec<MessagePart>) -> MessagePart {
         MessagePart {
+            part_id: None,
             mime_type: Some(mime.into()),
+            filename: None,
             headers: None,
             body: data.map(|d| MessageBody {
                 data: Some(d.to_string()),
+                attachment_id: None,
+                size: None,
             }),
             parts: if children.is_empty() {
                 None
@@ -426,7 +731,9 @@ mod tests {
             label_ids: Some(vec!["INBOX".into(), "UNREAD".into()]),
             internal_date: Some("1700000000000".into()),
             payload: Some(MessagePart {
+                part_id: None,
                 mime_type: None,
+                filename: None,
                 headers: Some(vec![
                     Header {
                         name: "From".into(),

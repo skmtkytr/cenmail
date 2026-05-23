@@ -15,6 +15,11 @@ export type Settings = {
   compose: {
     undoSendSeconds: number;
     defaultAccount: string | null;
+    // Per-account signature appended to the body of new composes (not
+    // replies/forwards). Keyed by account email. Empty string = no signature.
+    signatures: Record<string, string>;
+    // When true, new composes start in rich-text (contenteditable) mode.
+    richTextDefault: boolean;
   };
   inbox: {
     markAsReadOnOpen: boolean;
@@ -42,6 +47,8 @@ export const DEFAULT_SETTINGS: Settings = {
   compose: {
     undoSendSeconds: 5,
     defaultAccount: null,
+    signatures: {},
+    richTextDefault: false,
   },
   inbox: {
     markAsReadOnOpen: true,
@@ -75,7 +82,14 @@ function mergeDefaults(partial: unknown): Settings {
           : DEFAULT_SETTINGS.notifications.buckets,
     },
     appearance: { ...DEFAULT_SETTINGS.appearance, ...(p.appearance ?? {}) },
-    compose: { ...DEFAULT_SETTINGS.compose, ...(p.compose ?? {}) },
+    compose: {
+      ...DEFAULT_SETTINGS.compose,
+      ...(p.compose ?? {}),
+      signatures: {
+        ...DEFAULT_SETTINGS.compose.signatures,
+        ...(p.compose?.signatures ?? {}),
+      },
+    },
     inbox: { ...DEFAULT_SETTINGS.inbox, ...(p.inbox ?? {}) },
     privacy: { ...DEFAULT_SETTINGS.privacy, ...(p.privacy ?? {}) },
     calendar: {

@@ -24,13 +24,34 @@ describe("sanitizeMessageHtml", () => {
     expect(html).toContain('src="data:image/png;base64,AAAA"');
   });
 
-  it("preserves cid: image src (handled elsewhere)", () => {
+  it("preserves cid: image src when no map is supplied", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<img src="cid:abc123">',
       { allowRemoteImages: false, dark: false },
     );
     expect(blockedImages).toBe(0);
     expect(html).toContain('src="cid:abc123"');
+  });
+
+  it("rewrites cid: image src to a data: URL via cidMap", () => {
+    const dataUrl = "data:image/png;base64,AAAA";
+    const { html } = sanitizeMessageHtml('<img src="cid:logo">', {
+      allowRemoteImages: false,
+      dark: false,
+      cidMap: { logo: dataUrl },
+    });
+    expect(html).toContain(`src="${dataUrl}"`);
+    expect(html).not.toContain("cid:logo");
+  });
+
+  it("removes <base> and <link> tags so remote refs cannot leak", () => {
+    const { html } = sanitizeMessageHtml(
+      '<base href="https://evil/"><link rel="stylesheet" href="https://evil/x.css"><p>ok</p>',
+      { allowRemoteImages: true, dark: false },
+    );
+    expect(html).not.toMatch(/<base/i);
+    expect(html).not.toMatch(/<link/i);
+    expect(html).toContain("<p>ok</p>");
   });
 
   it("does not block when allowRemoteImages is true", () => {

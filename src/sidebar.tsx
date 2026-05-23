@@ -6,6 +6,14 @@ export type ViewMode = "mail" | "calendar";
 
 export type AggregateSync = { label: string; syncing: boolean } | null;
 
+function UnreadBadge(props: { n: number }) {
+  return (
+    <span class="inline-flex min-w-[18px] shrink-0 items-center justify-center rounded-full bg-[color:var(--color-accent)] px-1.5 text-[10px] font-semibold text-white tabular-nums">
+      {props.n > 999 ? "999+" : props.n}
+    </span>
+  );
+}
+
 export function Sidebar(props: {
   width: number;
   accounts: Account[];
@@ -20,12 +28,37 @@ export function Sidebar(props: {
   aggregateSync: AggregateSync;
   addingAccount: boolean;
   addError: string | null;
+  // `${email}|${folder}` → unread count. Missing key means 0.
+  unreadCounts: Record<string, number>;
   onAddAccount: () => void;
   onRemoveAccount: (id: number) => void;
   onCompose: () => void;
   onRefresh: () => void;
   onOpenSettings: () => void;
 }) {
+  function accountUnreadInbox(email: string): number {
+    return props.unreadCounts[`${email}|inbox`] ?? 0;
+  }
+  function totalUnreadInbox(): number {
+    let s = 0;
+    for (const a of props.accounts) s += accountUnreadInbox(a.email);
+    return s;
+  }
+  function folderUnread(folder: string): number {
+    // Sum across all accounts so a folder badge reflects the current
+    // "All Inboxes" scope. When a single account is selected the row's own
+    // badge already covers per-account view.
+    if (props.selectedAccount === "all") {
+      let s = 0;
+      for (const a of props.accounts) {
+        s += props.unreadCounts[`${a.email}|${folder}`] ?? 0;
+      }
+      return s;
+    }
+    const acct = props.accounts.find((a) => a.id === props.selectedAccount);
+    if (!acct) return 0;
+    return props.unreadCounts[`${acct.email}|${folder}`] ?? 0;
+  }
   return (
     <aside
       class="flex shrink-0 flex-col border-r border-[color:var(--color-border)] bg-[color:var(--color-surface)]"
@@ -104,7 +137,10 @@ export function Sidebar(props: {
           <div class="flex size-6 shrink-0 items-center justify-center rounded-full bg-zinc-400 text-xs text-white">
             ∞
           </div>
-          <span class="truncate">All Inboxes</span>
+          <span class="flex-1 truncate">All Inboxes</span>
+          <Show when={totalUnreadInbox() > 0}>
+            <UnreadBadge n={totalUnreadInbox()} />
+          </Show>
         </button>
         <For each={props.accounts}>
           {(a) => {
@@ -138,15 +174,18 @@ export function Sidebar(props: {
                       referrerpolicy="no-referrer"
                     />
                   </Show>
-                  <span class="truncate">{a.email}</span>
+                  <span class="flex-1 truncate">{a.email}</span>
+                  <Show when={accountUnreadInbox(a.email) > 0}>
+                    <UnreadBadge n={accountUnreadInbox(a.email)} />
+                  </Show>
                   <Show when={state()?.status === "syncing"}>
-                    <span class="ml-auto text-xs text-[color:var(--color-muted)]">
+                    <span class="text-xs text-[color:var(--color-muted)]">
                       ↻
                     </span>
                   </Show>
                   <Show when={state()?.status === "error"}>
                     <span
-                      class="ml-auto text-xs text-red-500"
+                      class="text-xs text-red-500"
                       title={state()?.error}
                     >
                       !
@@ -190,17 +229,21 @@ export function Sidebar(props: {
           <For each={props.folders}>
             {(f) => {
               const active = () => props.selectedFolder === f.id;
+              const unread = () => folderUnread(f.id);
               return (
                 <button
                   type="button"
                   onClick={() => props.setSelectedFolder(f.id)}
-                  class={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-sm hover:bg-[color:var(--color-surface-hover)] ${
+                  class={`flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-[color:var(--color-surface-hover)] ${
                     active()
                       ? "bg-[color:var(--color-surface-active)] font-medium"
                       : ""
                   }`}
                 >
                   <span>{f.label}</span>
+                  <Show when={unread() > 0}>
+                    <UnreadBadge n={unread()} />
+                  </Show>
                 </button>
               );
             }}
