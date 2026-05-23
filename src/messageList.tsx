@@ -1,6 +1,7 @@
 import {
   For,
   Show,
+  createEffect,
   createMemo,
   createSignal,
   onCleanup,
@@ -218,6 +219,26 @@ function VirtualizedList(props: {
   const slice = createMemo(() =>
     props.messages.slice(range().start, range().end),
   );
+
+  // Keep the selected row in view as the user steps j/k or clicks anywhere.
+  // Without this the absolute-positioned rows happily render outside the
+  // viewport (no native focus to follow) and j past the bottom leaves the
+  // selection invisible.
+  createEffect(() => {
+    const id = props.selectedMessageId;
+    if (!id || !scrollEl) return;
+    const idx = props.messages.findIndex((m) => m.id === id);
+    if (idx < 0) return;
+    const rowTop = idx * ROW_HEIGHT_PX;
+    const rowBottom = rowTop + ROW_HEIGHT_PX;
+    const viewTop = scrollEl.scrollTop;
+    const viewBottom = viewTop + viewportH();
+    if (rowTop < viewTop) {
+      scrollEl.scrollTop = rowTop;
+    } else if (rowBottom > viewBottom) {
+      scrollEl.scrollTop = rowBottom - viewportH();
+    }
+  });
 
   return (
     <div
