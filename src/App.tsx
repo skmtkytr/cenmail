@@ -21,7 +21,6 @@ import {
   cacheKey,
   classifyBucket,
   extractEmailAddresses,
-  matchesFolder,
   parseFromHeader,
   prefixSubject,
   type AccountSelection,
@@ -42,6 +41,14 @@ import {
 import { ToastContainer, showToast, triggerLastAction } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
 import { settings, notificationsEnabledFor, updateSettings } from "./settings";
+import {
+  bodyWithSignature,
+  isComposeEmpty as isComposeEmptyHelper,
+} from "./composeHelpers";
+import { isEditableTarget as isEditableTargetHelper } from "./keyboardHelpers";
+import { useDraftAutosave } from "./hooks/useDraftAutosave";
+import { useSendUndo } from "./hooks/useSendUndo";
+import { useTriage } from "./hooks/useTriage";
 import { SettingsModal } from "./settingsModal";
 import { ScheduledSendsModal } from "./scheduledSendsModal";
 import { CalendarPane } from "./calendarPane";
@@ -676,357 +683,36 @@ function App() {
     }
   }
 
-  async function modifyLabels(
-    message: MessageMeta,
-    add: string[],
-    remove: string[],
-  ) {
-    // Optimistic local update
-    applyLocalLabelChange(message, add, remove);
-    try {
-      await invoke("modify_message", {
-        email: message.account_email,
-        messageId: message.id,
-        addLabels: add,
-        removeLabels: remove,
-      });
-    } catch (err) {
-      setMessagesError(String(err));
-      reloadAllVisible();
-    }
-  }
-
-  async function trashMessageAction(message: MessageMeta) {
-    applyLocalLabelChange(message, ["TRASH"], [
-      "INBOX",
-      "UNREAD",
-      "STARRED",
-    ]);
-    try {
-      await invoke("trash_message", {
-        email: message.account_email,
-        messageId: message.id,
-      });
-    } catch (err) {
-      setMessagesError(String(err));
-      reloadAllVisible();
-    }
-  }
-
-  async function untrashMessageAction(message: MessageMeta) {
-    try {
-      await invoke("untrash_message", {
-        email: message.account_email,
-        messageId: message.id,
-      });
-      reloadAllVisible();
-    } catch (err) {
-      setMessagesError(String(err));
-    }
-  }
-
-  function archiveWithUndo(targets: MessageMeta[]) {
-    if (targets.length === 0) return;
-    const snapshot = targets.slice();
-    const next = pickAutoAdvance(targets);
-    // batch() coalesces the per-target optimistic cache mutations into a
-    // single Solid render flush — without it the rows pop out one by one
-    // as each setMessageCache call schedules its own paint.
-    batch(() => {
-      for (const t of targets) void modifyLabels(t, [], ["INBOX"]);
-    });
-    if (next && !selectedMessageId()) void selectMessage(next);
-    showToast({
-      message: targets.length === 1 ? "Archived" : `Archived ${targets.length}`,
-      action: {
-        label: "Undo",
-        onClick: () => {
-          for (const t of snapshot) void modifyLabels(t, ["INBOX"], []);
-          reloadAllVisible();
-        },
-      },
-    });
-  }
-
-  function trashWithUndo(targets: MessageMeta[]) {
-    if (targets.length === 0) return;
-    const snapshot = targets.slice();
-    const next = pickAutoAdvance(targets);
-    batch(() => {
-      for (const t of targets) void trashMessageAction(t);
-    });
-    if (next && !selectedMessageId()) void selectMessage(next);
-    showToast({
-      message:
-        targets.length === 1
-          ? "Moved to Trash"
-          : `Moved ${targets.length} to Trash`,
-      action: {
-        label: "Undo",
-        onClick: () => {
-          for (const t of snapshot) void untrashMessageAction(t);
-        },
-      },
-    });
-  }
-
-  async function snoozeMessages(targets: MessageMeta[], fireAtMs: number) {
-    if (targets.length === 0) return;
-    // Snapshot of the message that was selected before the optimistic
-    // update kicked in. If the network call fails we restore it so the
-    // user can retry against the same row instead of the auto-advanced
-    // neighbour.
-    const prevSelectionId = selectedMessageId();
-    const prevSelectionMeta = prevSelectionId
-      ? targets.find((t) => t.id === prevSelectionId) ?? null
-      : null;
-    const next = pickAutoAdvance(targets);
-    // All optimistic cache mutations land in one render flush, so the
-    // rows disappear together instead of one per Gmail round-trip.
-    batch(() => {
-      for (const t of targets) applyLocalLabelChange(t, [], ["INBOX"]);
-    });
-    if (next && !selectedMessageId()) void selectMessage(next);
-    // Fire every snooze in parallel; surface only the first failure to
-    // avoid stacking a toast per item if they all fail.
-    const results = await Promise.allSettled(
-      targets.map((t) =>
-        invoke("snooze_message", {
-          email: t.account_email,
-          messageId: t.id,
-          fireAtMs,
-        }),
+  // All bulk triage actions (archive/trash/star/snooze/mute/spam/etc.)
+  // and the optimistic-update plumbing they share live in their own
+  // hook. See src/hooks/useTriage.ts.
+  const triage = useTriage({
+    getCache: () =>
+      messageCache[cacheKey(selectedAccount(), selectedFolder(), debouncedSearch())],
+    setCache: (rows) =>
+      setMessageCache(
+        cacheKey(selectedAccount(), selectedFolder(), debouncedSearch()),
+        rows,
       ),
-    );
-    const failure = results.find((r) => r.status === "rejected");
-    if (failure) {
-      showToast({
-        message: `Snooze failed: ${(failure as PromiseRejectedResult).reason}`,
-        variant: "error",
-      });
-      reloadAllVisible();
-      // Roll the selection back to where it was so retry lands on the
-      // intended row instead of the auto-advanced neighbour.
-      if (prevSelectionMeta) void selectMessage(prevSelectionMeta);
-      return;
-    }
-    const when = new Date(fireAtMs);
-    const label =
-      targets.length === 1
-        ? `Snoozed until ${when.toLocaleString()}`
-        : `Snoozed ${targets.length} until ${when.toLocaleString()}`;
-    const snapshot = targets.slice();
-    showToast({
-      message: label,
-      action: {
-        label: "Undo",
-        onClick: () => {
-          for (const t of snapshot) {
-            void invoke("unsnooze_message", {
-              email: t.account_email,
-              messageId: t.id,
-            }).catch((e) =>
-              showToast({ message: `Undo failed: ${e}`, variant: "error" }),
-            );
-          }
-          reloadAllVisible();
-        },
-      },
-    });
-  }
-
-  async function muteThreadAction(message: MessageMeta) {
-    if (!message.thread_id) {
-      showToast({ message: "No thread to mute", variant: "error" });
-      return;
-    }
-    try {
-      await invoke("mute_thread", {
-        email: message.account_email,
-        threadId: message.thread_id,
-      });
-      reloadAllVisible();
-      showToast({
-        message: "Thread muted",
-        action: {
-          label: "Undo",
-          onClick: () => {
-            void invoke("unmute_thread", {
-              email: message.account_email,
-              threadId: message.thread_id,
-            }).then(() => reloadAllVisible());
-          },
-        },
-      });
-    } catch (err) {
-      showToast({ message: `Mute failed: ${err}`, variant: "error" });
-    }
-  }
-
-  function spamWithUndo(targets: MessageMeta[]) {
-    if (targets.length === 0) return;
-    const snapshot = targets.slice();
-    const next = pickAutoAdvance(targets);
-    batch(() => {
-      for (const t of targets) {
-        applyLocalLabelChange(t, ["SPAM"], ["INBOX", "UNREAD"]);
-        void invoke("modify_message", {
-          email: t.account_email,
-          messageId: t.id,
-          addLabels: ["SPAM"],
-          removeLabels: ["INBOX", "UNREAD"],
-        }).catch((err) => {
-          showToast({ message: `Spam failed: ${err}`, variant: "error" });
-          reloadAllVisible();
-        });
-      }
-    });
-    if (next && !selectedMessageId()) void selectMessage(next);
-    showToast({
-      message:
-        snapshot.length === 1
-          ? "Marked as spam"
-          : `Marked ${snapshot.length} as spam`,
-      action: {
-        label: "Undo",
-        onClick: () => {
-          for (const t of snapshot) {
-            void invoke("modify_message", {
-              email: t.account_email,
-              messageId: t.id,
-              addLabels: ["INBOX"],
-              removeLabels: ["SPAM"],
-            });
-          }
-          reloadAllVisible();
-        },
-      },
-    });
-  }
-
-  function notSpam(targets: MessageMeta[]) {
-    if (targets.length === 0) return;
-    batch(() => {
-      for (const t of targets) {
-        applyLocalLabelChange(t, ["INBOX"], ["SPAM"]);
-        void invoke("modify_message", {
-          email: t.account_email,
-          messageId: t.id,
-          addLabels: ["INBOX"],
-          removeLabels: ["SPAM"],
-        }).catch((err) => {
-          showToast({ message: `Restore failed: ${err}`, variant: "error" });
-          reloadAllVisible();
-        });
-      }
-    });
-    showToast({
-      message:
-        targets.length === 1
-          ? "Moved out of Spam"
-          : `Moved ${targets.length} out of Spam`,
-    });
-  }
-
-  function starToggleWithUndo(targets: MessageMeta[]) {
-    if (targets.length === 0) return;
-    const snapshot = targets.slice();
-    const allStarred = snapshot.every((t) => t.label_ids.includes("STARRED"));
-    batch(() => {
-      for (const t of snapshot) {
-        void modifyLabels(
-          t,
-          allStarred ? [] : ["STARRED"],
-          allStarred ? ["STARRED"] : [],
-        );
-      }
-    });
-    const noun = snapshot.length === 1 ? "" : ` ${snapshot.length}`;
-    showToast({
-      message: allStarred ? `Unstarred${noun}` : `Starred${noun}`,
-      action: {
-        label: "Undo",
-        onClick: () => {
-          for (const t of snapshot) {
-            void modifyLabels(
-              t,
-              allStarred ? ["STARRED"] : [],
-              allStarred ? [] : ["STARRED"],
-            );
-          }
-        },
-      },
-    });
-  }
-
-  // After bulk archive / trash / snooze / mute / spam, pick the message we
-  // should jump to so the preview never goes empty. Prefers the row right
-  // after the last target; falls back to the row right before the first.
-  function pickAutoAdvance(targets: MessageMeta[]): MessageMeta | null {
-    const list = visibleMessages() ?? [];
-    if (targets.length === 0 || list.length === 0) return null;
-    const ids = new Set(targets.map((t) => t.id));
-    let firstIdx = list.length;
-    let lastIdx = -1;
-    for (let i = 0; i < list.length; i++) {
-      if (!ids.has(list[i].id)) continue;
-      if (i < firstIdx) firstIdx = i;
-      if (i > lastIdx) lastIdx = i;
-    }
-    if (lastIdx < 0) return null;
-    for (let i = lastIdx + 1; i < list.length; i++) {
-      if (!ids.has(list[i].id)) return list[i];
-    }
-    for (let i = firstIdx - 1; i >= 0; i--) {
-      if (!ids.has(list[i].id)) return list[i];
-    }
-    return null;
-  }
-
-  function applyLocalLabelChange(
-    message: MessageMeta,
-    add: string[],
-    remove: string[],
-  ) {
-    const key = cacheKey(
-      selectedAccount(),
-      selectedFolder(),
-      debouncedSearch(),
-    );
-    const list = messageCache[key];
-    if (!list) return;
-    const newLabels = new Set(message.label_ids);
-    for (const r of remove) newLabels.delete(r);
-    for (const a of add) newLabels.add(a);
-    const nextLabels = Array.from(newLabels);
-    const updated: MessageMeta = {
-      ...message,
-      label_ids: nextLabels,
-      unread: nextLabels.includes("UNREAD"),
-    };
-    // Decide whether the message still belongs in the current folder; if not,
-    // drop it locally so the UI feels snappy.
-    const stillVisible = matchesCurrentFolder(nextLabels);
-    if (stillVisible) {
-      setMessageCache(
-        key,
-        list.map((m) => (m.id === message.id ? updated : m)),
-      );
-    } else {
-      setMessageCache(
-        key,
-        list.filter((m) => m.id !== message.id),
-      );
-      if (selectedMessageId() === message.id) {
-        setSelectedMessageId(null);
-        setMessageDetail(null);
-      }
-    }
-  }
-
-  function matchesCurrentFolder(labels: string[]): boolean {
-    return matchesFolder(labels, selectedFolder());
-  }
+    currentFolder: selectedFolder,
+    selectedMessageId,
+    setSelectedMessageId,
+    setMessageDetail,
+    visibleMessages: () => visibleMessages() ?? [],
+    selectMessage: (m) => selectMessage(m),
+    reloadAllVisible,
+    setMessagesError,
+  });
+  const {
+    modifyLabels,
+    archiveWithUndo,
+    trashWithUndo,
+    snoozeMessages,
+    muteThreadAction,
+    spamWithUndo,
+    notSpam,
+    starToggleWithUndo,
+  } = triage;
 
   async function selectMessage(message: MessageMeta) {
     setSelectedMessageId(message.id);
@@ -1104,46 +790,6 @@ function App() {
   const [compose, setCompose] = createSignal<ComposeState | null>(null);
   const [sendError, setSendError] = createSignal<string | null>(null);
 
-  async function scheduleCurrentCompose(fireAtMs: number) {
-    const cur = compose();
-    if (!cur) return;
-    if (!cur.from_account) {
-      setSendError("Choose an account to send from.");
-      return;
-    }
-    const to = extractEmailAddresses(cur.to);
-    if (to.length === 0) {
-      setSendError("Add at least one recipient in To.");
-      return;
-    }
-    try {
-      await invoke("schedule_send", {
-        request: {
-          fireAtMs,
-          fromAccount: cur.from_account,
-          to,
-          cc: extractEmailAddresses(cur.cc),
-          bcc: extractEmailAddresses(cur.bcc),
-          subject: cur.subject,
-          body: cur.body,
-          htmlBody: cur.html_body ?? null,
-          attachments: cur.attachments ?? [],
-          inReplyTo: cur.in_reply_to,
-          references: cur.references,
-        },
-      });
-      cancelPendingDraftSave();
-      bumpComposeSession();
-      clearDraft();
-      setCompose(null);
-      showToast({
-        message: `Scheduled for ${new Date(fireAtMs).toLocaleString()}`,
-      });
-    } catch (err) {
-      setSendError(String(err));
-    }
-  }
-
   // Local autosave: every compose (new, reply, forward) gets mirrored to
   // localStorage so a crash / window close doesn't lose typed text. The
   // server-side Gmail Drafts autosave further down covers cross-device
@@ -1163,139 +809,10 @@ function App() {
     } catch {}
   });
 
-  // Debounced Gmail Drafts autosave: 1.5s after the compose state stops
-  // changing, push the current draft to Gmail. The first save creates a
-  // draft and stashes its id back into compose state; subsequent saves
-  // update in place.
-  let draftSaveTimer: number | undefined;
-  let draftSaveInflight = false;
-  let draftSaveErrorShown = false;
-  // Bumped every time the user switches to a different compose (open new,
-  // discard, schedule, finish sending). Captured by saveDraftNow before the
-  // network round-trip so we can detect "the compose changed while my save
-  // was in flight" — without this the returned draft_id can leak into a
-  // sibling compose and silently overwrite an unrelated server draft.
-  let composeSession = 0;
-  function bumpComposeSession() {
-    composeSession += 1;
-  }
-
-  function scheduleDraftSave() {
-    if (draftSaveTimer !== undefined) clearTimeout(draftSaveTimer);
-    draftSaveTimer = window.setTimeout(saveDraftNow, 1500);
-  }
-  async function saveDraftNow() {
-    const cur = compose();
-    if (!cur) return;
-    if (draftSaveInflight) {
-      // A save is already in flight; reschedule once it lands so we never
-      // drop the latest edits.
-      scheduleDraftSave();
-      return;
-    }
-    if (isComposeEmpty(cur)) return;
-    if (!cur.from_account) return;
-    const session = composeSession;
-    const wasCreating = !cur.draft_id;
-    draftSaveInflight = true;
-    try {
-      const id = await invoke<string>("save_draft", {
-        request: {
-          draftId: cur.draft_id ?? null,
-          fromAccount: cur.from_account,
-          to: extractEmailAddresses(cur.to),
-          cc: extractEmailAddresses(cur.cc),
-          bcc: extractEmailAddresses(cur.bcc),
-          subject: cur.subject,
-          body: cur.body,
-          htmlBody: cur.html_body ?? null,
-          attachments: cur.attachments ?? [],
-          inReplyTo: cur.in_reply_to,
-          references: cur.references,
-        },
-      });
-      // Compose was discarded / replaced while we were in flight: do not
-      // graft the new id onto whatever the user is editing now. If we just
-      // created a brand new server draft it has no local owner — delete it
-      // so the user's Gmail Drafts folder doesn't accumulate orphans.
-      if (session !== composeSession) {
-        if (wasCreating) {
-          void invoke("delete_draft", {
-            email: cur.from_account,
-            draftId: id,
-          }).catch(() => {});
-        }
-        return;
-      }
-      const latest = compose();
-      if (latest && !latest.draft_id) {
-        setCompose({ ...latest, draft_id: id });
-      }
-      // Pin the fingerprint to what we just persisted; the autosave effect
-      // uses this to suppress its immediate re-fire after we stamp the new
-      // draft_id back onto state.
-      lastSavedFingerprint = composeFingerprint(compose() ?? cur);
-      draftSaveErrorShown = false;
-    } catch (err) {
-      // Surface only the first failure so we don't spam the user on every
-      // keystroke when offline. The flag is reset on the next success.
-      if (!draftSaveErrorShown) {
-        showToast({
-          message: `Draft autosave failed: ${err}`,
-          variant: "error",
-        });
-        draftSaveErrorShown = true;
-      }
-    } finally {
-      draftSaveInflight = false;
-    }
-  }
-  function cancelPendingDraftSave() {
-    if (draftSaveTimer !== undefined) {
-      clearTimeout(draftSaveTimer);
-      draftSaveTimer = undefined;
-    }
-  }
-
-  // Fingerprint of the saveable fields. Used by the autosave effect to skip
-  // round-trips that wouldn't change the server-side draft — most notably
-  // the immediate re-fire we get when saveDraftNow stamps draft_id back on
-  // state via setCompose.
-  let lastSavedFingerprint = "";
-  function composeFingerprint(c: ComposeState): string {
-    return JSON.stringify({
-      a: c.from_account,
-      t: c.to,
-      c: c.cc,
-      b: c.bcc,
-      s: c.subject,
-      bd: c.body,
-      h: c.html_body ?? "",
-      // We don't include the base64 bytes — same {filename,size,mime}
-      // sequence implies same upload payload.
-      at: (c.attachments ?? []).map((a) => `${a.filename}|${a.size}|${a.mime_type}`),
-      r: c.in_reply_to ?? "",
-      x: c.references ?? "",
-    });
-  }
-
-  createEffect(() => {
-    const cur = compose();
-    if (!cur) {
-      // Compose closed → reset the fingerprint so the next session starts
-      // dirty (otherwise the very first save would be skipped if the user
-      // re-types the same body).
-      lastSavedFingerprint = "";
-      return;
-    }
-    // Skip server autosave for replies/forwards (the user usually wants the
-    // draft local until they actually send) and for empty composes.
-    if (cur.in_reply_to) return;
-    if (cur.subject.startsWith("Fwd:")) return;
-    if (isComposeEmpty(cur)) return;
-    if (composeFingerprint(cur) === lastSavedFingerprint) return;
-    scheduleDraftSave();
-  });
+  // Gmail Drafts autosave: debounced 1.5 s, with session-token rollback
+  // for racing compose lifecycle events. See src/hooks/useDraftAutosave.ts.
+  const draftAutosave = useDraftAutosave(compose, setCompose);
+  const { bumpComposeSession, cancelPendingDraftSave } = draftAutosave;
 
   function defaultFromAccount(): string {
     // 1. Explicit user default in settings wins (if still valid).
@@ -1336,40 +853,9 @@ function App() {
     } catch {}
   }
 
-  function isComposeEmpty(c: ComposeState): boolean {
-    // Strip the auto-appended signature before checking emptiness so a
-    // fresh compose where the user hasn't typed anything yet doesn't
-    // trigger an autosave (which would land a signature-only ghost in
-    // the user's Gmail Drafts folder).
-    const bodyWithoutSig = stripSignature(c.from_account, c.body).trim();
-    return (
-      c.to.trim() === "" &&
-      c.cc.trim() === "" &&
-      c.bcc.trim() === "" &&
-      c.subject.trim() === "" &&
-      bodyWithoutSig === "" &&
-      (c.attachments ?? []).length === 0 &&
-      (c.html_body ?? "").trim() === ""
-    );
-  }
-
-  function stripSignature(account: string, body: string): string {
-    const sig = signatureFor(account);
-    if (!sig) return body;
-    const suffix = `\n\n--\n${sig}`;
-    return body.endsWith(suffix) ? body.slice(0, -suffix.length) : body;
-  }
-
-  function signatureFor(email: string): string {
-    return settings().compose.signatures[email] ?? "";
-  }
-  // Append the per-account signature to a fresh body. We never auto-append
-  // to replies/forwards — those already carry the quoted history and the
-  // signature would land in an awkward spot.
-  function bodyWithSignature(account: string): string {
-    const sig = signatureFor(account);
-    return sig ? `\n\n--\n${sig}` : "";
-  }
+  // Thin curried wrapper so existing call sites keep their no-arg shape.
+  // The actual logic lives in src/composeHelpers.ts.
+  const isComposeEmpty = (c: ComposeState) => isComposeEmptyHelper(settings(), c);
 
   function openCompose() {
     setSendError(null);
@@ -1387,7 +873,7 @@ function App() {
       cc: "",
       bcc: "",
       subject: "",
-      body: bodyWithSignature(acct),
+      body: bodyWithSignature(settings(), acct),
       in_reply_to: null,
       references: null,
       show_cc_bcc: false,
@@ -1497,108 +983,17 @@ function App() {
     setCompose({ ...cur, [key]: value });
   }
 
-  let pendingSendTimer: number | undefined;
-  let pendingSendPayload: ComposeState | null = null;
-
-  function fireSend(payload: ComposeState) {
-    const send = payload.draft_id
-      ? invoke("send_draft", {
-          email: payload.from_account,
-          draftId: payload.draft_id,
-        })
-      : invoke("send_message", {
-          request: {
-            fromAccount: payload.from_account,
-            to: extractEmailAddresses(payload.to),
-            cc: extractEmailAddresses(payload.cc),
-            bcc: extractEmailAddresses(payload.bcc),
-            subject: payload.subject,
-            body: payload.body,
-            htmlBody: payload.html_body ?? null,
-            attachments: payload.attachments ?? [],
-            inReplyTo: payload.in_reply_to,
-            references: payload.references,
-          },
-        });
-    send
-      .then(() => {
-        showToast({ message: "Sent" });
-        // Pull the new sent message into cache so it lands in Sent within
-        // a second or two instead of waiting for the next periodic sync.
-        void startSync(payload.from_account);
-      })
-      .catch((err) =>
-        showToast({ message: `Send failed: ${err}`, variant: "error" }),
-      );
-  }
-
-  async function handleSendCompose() {
-    const cur = compose();
-    if (!cur) return;
-    if (!cur.from_account) {
-      setSendError("Choose an account to send from.");
-      return;
-    }
-    const to = extractEmailAddresses(cur.to);
-    if (to.length === 0) {
-      setSendError("Add at least one recipient in To.");
-      return;
-    }
-    setSendError(null);
-
-    // If an earlier send is still in its undo window, fire it now so we don't
-    // lose it when this one queues up.
-    if (pendingSendTimer !== undefined && pendingSendPayload) {
-      window.clearTimeout(pendingSendTimer);
-      const earlier = pendingSendPayload;
-      pendingSendTimer = undefined;
-      pendingSendPayload = null;
-      fireSend(earlier);
-    }
-
-    // Flush any pending autosave so send_draft (which sends Gmail's server
-    // copy of the draft) sees the latest body. Without this a user who
-    // types and clicks Send within the 1.5s debounce loses those edits.
-    cancelPendingDraftSave();
-    await saveDraftNow();
-
-    // Re-read compose: saveDraftNow may have written back the draft_id.
-    const latest = compose() ?? cur;
-    const payload: ComposeState = { ...latest };
-    pendingSendPayload = payload;
-    clearDraft();
-    bumpComposeSession();
-    setCompose(null);
-
-    const undoMs = Math.max(0, settings().compose.undoSendSeconds) * 1000;
-    if (undoMs === 0) {
-      pendingSendPayload = null;
-      fireSend(payload);
-      return;
-    }
-
-    pendingSendTimer = window.setTimeout(() => {
-      pendingSendTimer = undefined;
-      pendingSendPayload = null;
-      fireSend(payload);
-    }, undoMs);
-
-    showToast({
-      message: "Sending…",
-      timeoutMs: undoMs + 500,
-      action: {
-        label: "Undo",
-        onClick: () => {
-          if (pendingSendTimer !== undefined) {
-            window.clearTimeout(pendingSendTimer);
-            pendingSendTimer = undefined;
-          }
-          pendingSendPayload = null;
-          setCompose(payload);
-        },
-      },
-    });
-  }
+  // Send-with-undo + scheduled-send live in their own hook so the
+  // pending-payload state and the 5s undo timer aren't mixed in with
+  // the rest of App.tsx. See src/hooks/useSendUndo.ts.
+  const { handleSendCompose, scheduleCurrentCompose } = useSendUndo(
+    compose,
+    setCompose,
+    setSendError,
+    draftAutosave,
+    startSync,
+    clearDraft,
+  );
 
   const [contextMenu, setContextMenu] = createSignal<{
     x: number;
@@ -1874,13 +1269,7 @@ function App() {
     if (target) void selectMessage(target);
   }
 
-  function isEditableTarget(t: EventTarget | null): boolean {
-    if (!(t instanceof HTMLElement)) return false;
-    const tag = t.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
-    if (t.isContentEditable) return true;
-    return false;
-  }
+  const isEditableTarget = isEditableTargetHelper;
 
   function handleShortcut(e: KeyboardEvent) {
     if (e.key === "Escape") {
