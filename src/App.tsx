@@ -978,6 +978,11 @@ function App() {
     setMessageDetail(null);
     setMessageDetailError(null);
     setMessageDetailLoading(true);
+    // If the previous message's iframe was the activeElement, the host's
+    // document keydown handler stops receiving keys — so j / k / e go
+    // nowhere after triage. Hand focus back to the host explicitly.
+    const active = document.activeElement;
+    if (active instanceof HTMLIFrameElement) active.blur();
     if (message.unread && settings().inbox.markAsReadOnOpen) {
       void modifyLabels(message, [], ["UNREAD"]);
     }
@@ -1847,10 +1852,12 @@ function App() {
     const bulk = () => selectionTargets(m);
     switch (e.key) {
       case "j":
+      case "ArrowDown":
         e.preventDefault();
         moveSelection(1);
         break;
       case "k":
+      case "ArrowUp":
         e.preventDefault();
         moveSelection(-1);
         break;

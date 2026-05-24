@@ -18,6 +18,7 @@ const IFRAME_ENTRIES: Entry[] = [
 
 const ENTRIES: Entry[] = [
   { combo: ["j", "k"], separator: " / ", label: "Next / previous message" },
+  { combo: ["↓", "↑"], separator: " / ", label: "Next / previous message" },
   { combo: ["e"], label: "Archive" },
   { combo: ["#", "Del"], separator: " / ", label: "Move to Trash" },
   { combo: ["s"], label: "Toggle star" },

@@ -60,7 +60,7 @@ Built with Tauri 2 (Rust) + Solid.js + TypeScript + Tailwind v4. Google
 
 | Key | Action |
 |---|---|
-| `j` / `k` | Next / previous message |
+| `j` / `k` (or `↓` / `↑`) | Next / previous message |
 | `e` | Archive |
 | `#` / `Del` | Move to Trash |
 | `s` | Toggle star |
