@@ -179,17 +179,22 @@ async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
             .collect()
     };
     for email in due_accounts {
-        let st = app.state::<AppState>();
-        match commands::sync_account(app.clone(), st, email.clone()).await {
-            Ok(n) => {
-                if n > 0 {
-                    tracing::debug!(%email, applied = n, "periodic sync");
+        // Fire-and-forget so a flaky-network sync_account on one account
+        // can't delay snoozes / scheduled sends on the same tick.
+        let app_for_task = app.clone();
+        tokio::spawn(async move {
+            let st = app_for_task.state::<AppState>();
+            match commands::sync_account(app_for_task.clone(), st, email.clone()).await {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::debug!(%email, applied = n, "periodic sync");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%email, error = %e, "periodic sync failed");
                 }
             }
-            Err(e) => {
-                tracing::warn!(%email, error = %e, "periodic sync failed");
-            }
-        }
+        });
     }
 
     // Scheduled sends
