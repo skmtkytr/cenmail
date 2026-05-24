@@ -6,8 +6,9 @@ pub mod gmail;
 mod oauth;
 pub mod secret;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::params;
 use tauri::Manager;
@@ -23,6 +24,11 @@ use commands::{
 };
 
 const TIMER_TICK: Duration = Duration::from_secs(60);
+/// Minimum wall-clock gap between automatic syncs for the same account.
+/// The user-initiated startup sync stamps `last_sync_at`, so the first
+/// periodic tick after launch waits this long before issuing another
+/// incremental sync. 3 minutes matches what Gmail web does roughly.
+const PERIODIC_SYNC_INTERVAL: Duration = Duration::from_secs(180);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -57,6 +63,7 @@ pub fn run() {
         oauth_config,
         token_cache: Arc::new(gmail::auth::TokenCache::new()),
         http,
+        last_sync_at: Mutex::new(HashMap::new()),
     };
 
     tauri::Builder::default()
@@ -140,6 +147,47 @@ async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!(%email, %message_id, error = %format!("{e:#}"), "timer: unsnooze failed");
+            }
+        }
+    }
+
+    // Periodic incremental sync: keep the mailbox fresh while the window
+    // is open. Gating on PERIODIC_SYNC_INTERVAL prevents the timer from
+    // racing with the user's startup syncAll() and from re-firing every
+    // minute when nothing is actually new.
+    let now = Instant::now();
+    let due_accounts: Vec<String> = {
+        let emails: Vec<String> = {
+            let conn = state
+                .db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            let mut stmt = conn.prepare("SELECT email FROM accounts")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let map = state
+            .last_sync_at
+            .lock()
+            .map_err(|e| anyhow::anyhow!("last_sync_at lock: {e}"))?;
+        emails
+            .into_iter()
+            .filter(|email| match map.get(email) {
+                Some(t) => now.duration_since(*t) >= PERIODIC_SYNC_INTERVAL,
+                None => true,
+            })
+            .collect()
+    };
+    for email in due_accounts {
+        let st = app.state::<AppState>();
+        match commands::sync_account(app.clone(), st, email.clone()).await {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::debug!(%email, applied = n, "periodic sync");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%email, error = %e, "periodic sync failed");
             }
         }
     }

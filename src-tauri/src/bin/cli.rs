@@ -262,6 +262,7 @@ fn build_state() -> Result<AppState> {
         oauth_config,
         token_cache: Arc::new(TokenCache::new()),
         http,
+        last_sync_at: Mutex::new(std::collections::HashMap::new()),
     })
 }
 

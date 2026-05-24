@@ -2,8 +2,9 @@ use chrono::{TimeZone, Utc};
 use futures::stream::{self, StreamExt};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{
@@ -29,6 +30,10 @@ pub struct AppState {
     pub oauth_config: OAuthConfig,
     pub token_cache: Arc<TokenCache>,
     pub http: reqwest::Client,
+    /// Per-account wall-clock of the last successful sync. Consulted by the
+    /// background timer to decide whether an account is overdue for an
+    /// incremental sync.
+    pub last_sync_at: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -208,18 +213,29 @@ pub async fn sync_account(
         .map(|v| v as u64)
     };
 
-    if let Some(start) = stored_history_id {
+    let result = if let Some(start) = stored_history_id {
         match incremental_sync(&app, &state, &email, start).await {
-            Ok(touched) => return Ok(touched),
+            Ok(touched) => Ok(touched),
             Err(SyncErr::Expired) => {
                 tracing::info!(%email, "sync: history expired, falling through to bootstrap");
-                // fall through
+                bootstrap_sync(&app, &state, &email).await
             }
-            Err(SyncErr::Other(e)) => return Err(e),
+            Err(SyncErr::Other(e)) => Err(e),
+        }
+    } else {
+        bootstrap_sync(&app, &state, &email).await
+    };
+
+    // Stamp the last-successful-sync time so the periodic timer knows the
+    // account isn't due again for a while. We mark even on no-op syncs so a
+    // failing account doesn't get retried every tick (use err path to clear
+    // the stamp if we want aggressive retry on failure).
+    if result.is_ok() {
+        if let Ok(mut map) = state.last_sync_at.lock() {
+            map.insert(email.clone(), Instant::now());
         }
     }
-
-    bootstrap_sync(&app, &state, &email).await
+    result
 }
 
 enum SyncErr {
