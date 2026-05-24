@@ -1144,9 +1144,11 @@ function App() {
     }
   }
 
-  // Local autosave: keep the current compose around in localStorage so a
-  // crash / window close restores it. Server-side autosave below handles
-  // cross-device persistence via Gmail Drafts.
+  // Local autosave: every compose (new, reply, forward) gets mirrored to
+  // localStorage so a crash / window close doesn't lose typed text. The
+  // server-side Gmail Drafts autosave further down covers cross-device
+  // persistence — but only for *new* composes, since saving a reply as a
+  // standalone draft would split the conversation thread on the server.
   //
   // Attachments are deliberately excluded: their base64 bytes can be tens
   // of MB and localStorage caps at ~5–10 MB in WebKit. Serializing them on
@@ -1155,7 +1157,6 @@ function App() {
   createEffect(() => {
     const cur = compose();
     if (!cur) return;
-    if (cur.in_reply_to || cur.subject.startsWith("Fwd:")) return;
     const persistable: ComposeState = { ...cur, attachments: [] };
     try {
       localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(persistable));
@@ -1336,15 +1337,27 @@ function App() {
   }
 
   function isComposeEmpty(c: ComposeState): boolean {
+    // Strip the auto-appended signature before checking emptiness so a
+    // fresh compose where the user hasn't typed anything yet doesn't
+    // trigger an autosave (which would land a signature-only ghost in
+    // the user's Gmail Drafts folder).
+    const bodyWithoutSig = stripSignature(c.from_account, c.body).trim();
     return (
       c.to.trim() === "" &&
       c.cc.trim() === "" &&
       c.bcc.trim() === "" &&
       c.subject.trim() === "" &&
-      c.body.trim() === "" &&
+      bodyWithoutSig === "" &&
       (c.attachments ?? []).length === 0 &&
       (c.html_body ?? "").trim() === ""
     );
+  }
+
+  function stripSignature(account: string, body: string): string {
+    const sig = signatureFor(account);
+    if (!sig) return body;
+    const suffix = `\n\n--\n${sig}`;
+    return body.endsWith(suffix) ? body.slice(0, -suffix.length) : body;
   }
 
   function signatureFor(email: string): string {
@@ -1656,9 +1669,13 @@ function App() {
   const [scheduledOpen, setScheduledOpen] = createSignal(false);
   useCmdKHotkey(() => setPaletteOpen((v) => !v));
 
-  // Build the palette command list from current state on each open. Cheap
-  // because Solid only recomputes when the dependencies actually change.
+  // Build the palette command list on demand. Returning [] when the
+  // palette is closed means Solid only tracks (and rebuilds on) the
+  // underlying signals while the user is actually looking at the list —
+  // typing in the search field or switching messages with the palette
+  // closed no longer rebuilds 30+ Command objects per keystroke.
   const paletteCommands = createMemo<Command[]>(() => {
+    if (!paletteOpen()) return [];
     const m = currentMessage();
     const cmds: Command[] = [
       {
@@ -1949,20 +1966,23 @@ function App() {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (compose() || showShortcuts()) return;
 
+    // Mail-only shortcuts must not fire in calendar view — pressing 'm'
+    // there would mute the previously-selected mail thread, 'e' would
+    // archive it, etc. Keep compose (c) and shortcut help (?) alive
+    // because they make sense from any view.
+    const calendarPassthrough = e.key === "c" || e.key === "?";
+    if (viewMode() !== "mail" && !calendarPassthrough) return;
+
     const m = currentMessage();
     const bulk = () => selectionTargets(m);
     switch (e.key) {
       case "j":
       case "ArrowDown":
-        // Calendar view doesn't have a message list; let the browser keep
-        // native scroll on arrow keys instead of swallowing them.
-        if (viewMode() !== "mail") return;
         e.preventDefault();
         moveSelection(1);
         break;
       case "k":
       case "ArrowUp":
-        if (viewMode() !== "mail") return;
         e.preventDefault();
         moveSelection(-1);
         break;

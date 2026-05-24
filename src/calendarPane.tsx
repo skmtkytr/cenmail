@@ -5,6 +5,7 @@ import {
   createMemo,
   createResource,
   createSignal,
+  onCleanup,
   onMount,
 } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
@@ -572,6 +573,56 @@ export function CalendarPane(props: { accounts: Account[] }) {
     e.preventDefault();
     setHourPx(hourPx() + (e.deltaY < 0 ? HOUR_PX_STEP : -HOUR_PX_STEP));
   }
+
+  // Calendar-only keyboard shortcuts. Registered on document because the
+  // pane itself has no focusable container; CalendarPane is unmounted
+  // when leaving calendar view so the listener auto-cleans.
+  function isEditableTarget(t: EventTarget | null): boolean {
+    if (!(t instanceof HTMLElement)) return false;
+    const tag = t.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (t.isContentEditable) return true;
+    return false;
+  }
+  onMount(() => {
+    function onCalKey(e: KeyboardEvent) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (isEditableTarget(e.target)) return;
+      // Skip while any calendar modal is open — they own their own
+      // Esc handling and shouldn't steal navigation keys.
+      if (editorDraft() || selectedEvent() || pickerOpen()) return;
+      switch (e.key) {
+        case "ArrowLeft":
+        case "h":
+          e.preventDefault();
+          gotoPrev();
+          break;
+        case "ArrowRight":
+        case "l":
+          e.preventDefault();
+          gotoNext();
+          break;
+        case "t":
+          e.preventDefault();
+          gotoToday();
+          break;
+        case "d":
+          e.preventDefault();
+          setViewMode("day");
+          break;
+        case "w":
+          e.preventDefault();
+          setViewMode("week");
+          break;
+        case "M":
+          e.preventDefault();
+          setViewMode("month");
+          break;
+      }
+    }
+    document.addEventListener("keydown", onCalKey);
+    onCleanup(() => document.removeEventListener("keydown", onCalKey));
+  });
 
   return (
     <section class="flex min-w-0 flex-1 flex-col bg-[color:var(--color-surface)]">

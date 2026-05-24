@@ -7,6 +7,13 @@ type Entry = {
   label: string;
 };
 
+const CALENDAR_ENTRIES: Entry[] = [
+  { combo: ["←", "→"], separator: " / ", label: "Previous / next (day / week / month)" },
+  { combo: ["h", "l"], separator: " / ", label: "Previous / next (vim style)" },
+  { combo: ["t"], label: "Today" },
+  { combo: ["d", "w", "M"], separator: " / ", label: "Switch to Day / Week / Month" },
+];
+
 const IFRAME_ENTRIES: Entry[] = [
   { combo: ["f"], label: "Show link hints" },
   { combo: ["j", "k"], separator: " / ", label: "Scroll down / up" },
@@ -78,6 +85,30 @@ export function ShortcutsHelpModal(props: {
                     <td
                       class={`py-1 pr-4 ${entry.separator === " + " ? "whitespace-nowrap" : ""}`}
                     >
+                      <For each={entry.combo}>
+                        {(key, i) => (
+                          <>
+                            <Show when={i() > 0}>{entry.separator}</Show>
+                            <kbd class={KBD_CLASS}>{key}</kbd>
+                          </>
+                        )}
+                      </For>
+                    </td>
+                    <td>{entry.label}</td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+          <h3 class="mt-5 mb-2 text-xs font-semibold uppercase tracking-wide text-[color:var(--color-muted)]">
+            Calendar view
+          </h3>
+          <table class="w-full text-sm">
+            <tbody>
+              <For each={CALENDAR_ENTRIES}>
+                {(entry) => (
+                  <tr>
+                    <td class="py-1 pr-4">
                       <For each={entry.combo}>
                         {(key, i) => (
                           <>
