@@ -1,5 +1,6 @@
 import {
   Show,
+  batch,
   createEffect,
   createMemo,
   createResource,
@@ -307,6 +308,20 @@ function App() {
     reloadCurrentList();
   }
 
+  // Debounced refresh for backend `messages:changed` bursts (typically one
+  // event per row in a bulk action). The optimistic update already shows
+  // the post-action state; the reload is only here to pick up changes
+  // from the CLI / other windows / timer-fired actions.
+  let changedReloadTimer: number | undefined;
+  function scheduleChangedReload() {
+    if (changedReloadTimer !== undefined) clearTimeout(changedReloadTimer);
+    changedReloadTimer = window.setTimeout(() => {
+      changedReloadTimer = undefined;
+      reloadCurrentList();
+      void refreshUnreadCounts();
+    }, 300);
+  }
+
   // Reload the visible list at most once per `LIST_RELOAD_DEBOUNCE_MS` while
   // a sync is streaming progress events. Without debounce we'd thrash the DB
   // on every batch.
@@ -516,9 +531,11 @@ function App() {
       await listen<string>("messages:changed", () => {
         // User-initiated mutations apply locally via applyLocalLabelChange
         // before this event fires, so we only refetch the current view to
-        // pick up changes from the CLI / other windows / timer-fired actions.
-        reloadCurrentList();
-        void refreshUnreadCounts();
+        // pick up changes from the CLI / other windows / timer-fired
+        // actions. Debounce so a bulk action (N rows → N backend calls
+        // → N events) collapses into a single reload after the burst
+        // settles, instead of paint-flickering for each backend ack.
+        scheduleChangedReload();
       }),
     );
 
@@ -711,7 +728,12 @@ function App() {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
     const next = pickAutoAdvance(targets);
-    for (const t of targets) void modifyLabels(t, [], ["INBOX"]);
+    // batch() coalesces the per-target optimistic cache mutations into a
+    // single Solid render flush — without it the rows pop out one by one
+    // as each setMessageCache call schedules its own paint.
+    batch(() => {
+      for (const t of targets) void modifyLabels(t, [], ["INBOX"]);
+    });
     if (next && !selectedMessageId()) void selectMessage(next);
     showToast({
       message: targets.length === 1 ? "Archived" : `Archived ${targets.length}`,
@@ -729,7 +751,9 @@ function App() {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
     const next = pickAutoAdvance(targets);
-    for (const t of targets) void trashMessageAction(t);
+    batch(() => {
+      for (const t of targets) void trashMessageAction(t);
+    });
     if (next && !selectedMessageId()) void selectMessage(next);
     showToast({
       message:
@@ -748,25 +772,32 @@ function App() {
   async function snoozeMessages(targets: MessageMeta[], fireAtMs: number) {
     if (targets.length === 0) return;
     const next = pickAutoAdvance(targets);
-    for (const t of targets) {
-      // Optimistic: remove from current cache so it disappears immediately.
-      applyLocalLabelChange(t, [], ["INBOX"]);
-      try {
-        await invoke("snooze_message", {
+    // All optimistic cache mutations land in one render flush, so the
+    // rows disappear together instead of one per Gmail round-trip.
+    batch(() => {
+      for (const t of targets) applyLocalLabelChange(t, [], ["INBOX"]);
+    });
+    if (next && !selectedMessageId()) void selectMessage(next);
+    // Fire every snooze in parallel; surface only the first failure to
+    // avoid stacking a toast per item if they all fail.
+    const results = await Promise.allSettled(
+      targets.map((t) =>
+        invoke("snooze_message", {
           email: t.account_email,
           messageId: t.id,
           fireAtMs,
-        });
-      } catch (err) {
-        showToast({
-          message: `Snooze failed: ${err}`,
-          variant: "error",
-        });
-        reloadAllVisible();
-        return;
-      }
+        }),
+      ),
+    );
+    const failure = results.find((r) => r.status === "rejected");
+    if (failure) {
+      showToast({
+        message: `Snooze failed: ${(failure as PromiseRejectedResult).reason}`,
+        variant: "error",
+      });
+      reloadAllVisible();
+      return;
     }
-    if (next && !selectedMessageId()) void selectMessage(next);
     const when = new Date(fireAtMs);
     const label =
       targets.length === 1
@@ -824,18 +855,20 @@ function App() {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
     const next = pickAutoAdvance(targets);
-    for (const t of targets) {
-      applyLocalLabelChange(t, ["SPAM"], ["INBOX", "UNREAD"]);
-      void invoke("modify_message", {
-        email: t.account_email,
-        messageId: t.id,
-        addLabels: ["SPAM"],
-        removeLabels: ["INBOX", "UNREAD"],
-      }).catch((err) => {
-        showToast({ message: `Spam failed: ${err}`, variant: "error" });
-        reloadAllVisible();
-      });
-    }
+    batch(() => {
+      for (const t of targets) {
+        applyLocalLabelChange(t, ["SPAM"], ["INBOX", "UNREAD"]);
+        void invoke("modify_message", {
+          email: t.account_email,
+          messageId: t.id,
+          addLabels: ["SPAM"],
+          removeLabels: ["INBOX", "UNREAD"],
+        }).catch((err) => {
+          showToast({ message: `Spam failed: ${err}`, variant: "error" });
+          reloadAllVisible();
+        });
+      }
+    });
     if (next && !selectedMessageId()) void selectMessage(next);
     showToast({
       message:
@@ -861,18 +894,20 @@ function App() {
 
   function notSpam(targets: MessageMeta[]) {
     if (targets.length === 0) return;
-    for (const t of targets) {
-      applyLocalLabelChange(t, ["INBOX"], ["SPAM"]);
-      void invoke("modify_message", {
-        email: t.account_email,
-        messageId: t.id,
-        addLabels: ["INBOX"],
-        removeLabels: ["SPAM"],
-      }).catch((err) => {
-        showToast({ message: `Restore failed: ${err}`, variant: "error" });
-        reloadAllVisible();
-      });
-    }
+    batch(() => {
+      for (const t of targets) {
+        applyLocalLabelChange(t, ["INBOX"], ["SPAM"]);
+        void invoke("modify_message", {
+          email: t.account_email,
+          messageId: t.id,
+          addLabels: ["INBOX"],
+          removeLabels: ["SPAM"],
+        }).catch((err) => {
+          showToast({ message: `Restore failed: ${err}`, variant: "error" });
+          reloadAllVisible();
+        });
+      }
+    });
     showToast({
       message:
         targets.length === 1
@@ -885,13 +920,15 @@ function App() {
     if (targets.length === 0) return;
     const snapshot = targets.slice();
     const allStarred = snapshot.every((t) => t.label_ids.includes("STARRED"));
-    for (const t of snapshot) {
-      void modifyLabels(
-        t,
-        allStarred ? [] : ["STARRED"],
-        allStarred ? ["STARRED"] : [],
-      );
-    }
+    batch(() => {
+      for (const t of snapshot) {
+        void modifyLabels(
+          t,
+          allStarred ? [] : ["STARRED"],
+          allStarred ? ["STARRED"] : [],
+        );
+      }
+    });
     const noun = snapshot.length === 1 ? "" : ` ${snapshot.length}`;
     showToast({
       message: allStarred ? `Unstarred${noun}` : `Starred${noun}`,
@@ -1564,22 +1601,28 @@ function App() {
       // menu label ("Mark as read" / "Mark as unread") matches what the
       // bulk action does.
       const wasUnread = m.unread;
-      for (const t of targets) {
-        void modifyLabels(
-          t,
-          wasUnread ? [] : ["UNREAD"],
-          wasUnread ? ["UNREAD"] : [],
-        );
-      }
+      batch(() => {
+        for (const t of targets) {
+          void modifyLabels(
+            t,
+            wasUnread ? [] : ["UNREAD"],
+            wasUnread ? ["UNREAD"] : [],
+          );
+        }
+      });
     },
     toggleStar: (m) => starToggleWithUndo(contextTargets(m)),
     archive: (m) => archiveWithUndo(contextTargets(m)),
     trash: (m) => trashWithUndo(contextTargets(m)),
     restoreFromTrash: (m) => {
-      for (const t of contextTargets(m)) void modifyLabels(t, [], ["TRASH"]);
+      batch(() => {
+        for (const t of contextTargets(m)) void modifyLabels(t, [], ["TRASH"]);
+      });
     },
     moveToInbox: (m) => {
-      for (const t of contextTargets(m)) void modifyLabels(t, ["INBOX"], []);
+      batch(() => {
+        for (const t of contextTargets(m)) void modifyLabels(t, ["INBOX"], []);
+      });
     },
     markSpam: (m) => spamWithUndo(contextTargets(m)),
     notSpam: (m) => notSpam(contextTargets(m)),
@@ -1941,13 +1984,15 @@ function App() {
         if (targets.length > 0) {
           e.preventDefault();
           const allUnread = targets.every((t) => t.unread);
-          for (const t of targets) {
-            void modifyLabels(
-              t,
-              allUnread ? [] : ["UNREAD"],
-              allUnread ? ["UNREAD"] : [],
-            );
-          }
+          batch(() => {
+            for (const t of targets) {
+              void modifyLabels(
+                t,
+                allUnread ? [] : ["UNREAD"],
+                allUnread ? ["UNREAD"] : [],
+              );
+            }
+          });
         }
         break;
       }
