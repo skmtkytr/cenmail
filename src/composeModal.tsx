@@ -3,7 +3,7 @@ import type { Account, ComposeAttachment, ComposeState } from "./types";
 import { snoozePresets } from "./types";
 import { useEscClose } from "./modal";
 
-const ATTACHMENT_LIMIT_MB = 25;
+import { ATTACHMENT_LIMIT_MB } from "./constants";
 
 function fileToB64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {

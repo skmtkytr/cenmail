@@ -1,14 +1,10 @@
 //! Authenticated Gmail / Calendar request plumbing: 401-refresh and
 //! 429/403-backoff retries that wrap every API call cenmail makes.
 
-use std::time::Duration;
-
+use crate::constants::{AUTH_RETRY_DELAY, RATE_LIMIT_BASE_DELAY};
 use crate::gmail;
 
 use super::AppState;
-
-pub(crate) const AUTH_RETRY_DELAY: Duration = Duration::from_millis(500);
-pub(crate) const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_millis(800);
 
 pub(crate) type BoxFut<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;

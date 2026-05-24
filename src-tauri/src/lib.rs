@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod config;
+pub mod constants;
 pub mod db;
 pub mod gcal;
 pub mod gmail;
@@ -8,7 +9,7 @@ pub mod secret;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rusqlite::params;
 use tauri::Manager;
@@ -23,12 +24,7 @@ use commands::{
     untrash_message, update_event, AppState,
 };
 
-const TIMER_TICK: Duration = Duration::from_secs(60);
-/// Minimum wall-clock gap between automatic syncs for the same account.
-/// The user-initiated startup sync stamps `last_sync_at`, so the first
-/// periodic tick after launch waits this long before issuing another
-/// incremental sync. 3 minutes matches what Gmail web does roughly.
-const PERIODIC_SYNC_INTERVAL: Duration = Duration::from_secs(180);
+use constants::{PERIODIC_SYNC_INTERVAL, TIMER_TICK};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

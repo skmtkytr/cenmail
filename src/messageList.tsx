@@ -16,11 +16,7 @@ type BucketCounts = {
   notifications: number;
 };
 
-// All rows share a fixed height so we can virtualize without measuring each
-// child. ROW_HEIGHT_PX must match the rendered MessageRow exactly — keep them
-// in sync if you change row padding/content.
-const ROW_HEIGHT_PX = 76;
-const OVERSCAN_ROWS = 6;
+import { OVERSCAN_ROWS, ROW_HEIGHT_PX } from "./constants";
 
 export function MessageList(props: {
   width: number;

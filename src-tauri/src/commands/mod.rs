@@ -35,7 +35,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, State};
 
-use auth::{is_unauthorized, is_rate_limited, with_token, AUTH_RETRY_DELAY, RATE_LIMIT_BASE_DELAY};
+use auth::{is_unauthorized, is_rate_limited, with_token};
+use crate::constants::{AUTH_RETRY_DELAY, RATE_LIMIT_BASE_DELAY};
 
 use crate::{
     config::OAuthConfig,
@@ -46,9 +47,7 @@ use crate::{
     },
 };
 
-const SYNC_PARALLEL: usize = 8;
-const SYNC_BATCH: usize = 100;
-const SYNC_PROGRESS_EVERY: usize = 50;
+use crate::constants::{SYNC_BATCH, SYNC_PARALLEL, SYNC_PROGRESS_EVERY};
 
 pub struct AppState {
     pub db: Mutex<Connection>,

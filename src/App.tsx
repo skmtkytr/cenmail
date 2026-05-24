@@ -64,7 +64,16 @@ import { MessageList } from "./messageList";
 import { Sidebar } from "./sidebar";
 import "./App.css";
 
-const DRAFT_STORAGE_KEY = "cenmail:compose-draft";
+import {
+  DRAFT_STORAGE_KEY,
+  LIST_RELOAD_DEBOUNCE_MS,
+  MESSAGES_CHANGED_DEBOUNCE_MS,
+  NOTIFY_LAST_SEEN_KEY,
+  PANE_DEFAULTS,
+  PANE_MAX,
+  PANE_MIN,
+  SEARCH_DEBOUNCE_MS,
+} from "./constants";
 
 function usePrefersDark(): () => boolean {
   const [dark, setDark] = createSignal(
@@ -97,9 +106,6 @@ function stripHtml(html: string): string {
   return div.textContent ?? "";
 }
 
-const PANE_DEFAULTS = { sidebar: 240, list: 384 };
-const PANE_MIN = { sidebar: 160, list: 240 };
-const PANE_MAX = { sidebar: 480, list: 800 };
 
 function readStoredWidth(key: keyof typeof PANE_DEFAULTS): number {
   try {
@@ -284,13 +290,12 @@ function App() {
       changedReloadTimer = undefined;
       reloadCurrentList();
       void refreshUnreadCounts();
-    }, 300);
+    }, MESSAGES_CHANGED_DEBOUNCE_MS);
   }
 
-  // Reload the visible list at most once per `LIST_RELOAD_DEBOUNCE_MS` while
-  // a sync is streaming progress events. Without debounce we'd thrash the DB
-  // on every batch.
-  const LIST_RELOAD_DEBOUNCE_MS = 1500;
+  // Reload the visible list at most once per LIST_RELOAD_DEBOUNCE_MS while
+  // a sync is streaming progress events. Without debounce we'd thrash the
+  // DB on every batch.
   let listReloadTimer: number | undefined;
   function scheduleListReload() {
     if (listReloadTimer !== undefined) return;
@@ -336,7 +341,7 @@ function App() {
     if (searchDebounce !== undefined) clearTimeout(searchDebounce);
     searchDebounce = window.setTimeout(() => {
       setDebouncedSearch(value.trim());
-    }, 200);
+    }, SEARCH_DEBOUNCE_MS);
   }
 
   function clearSearch() {
@@ -527,10 +532,9 @@ function App() {
     }
   }
 
-  const NOTIFY_KEY = "cenmail:last-notified-ms";
   function getLastNotifiedMs(): number {
     try {
-      const raw = localStorage.getItem(NOTIFY_KEY);
+      const raw = localStorage.getItem(NOTIFY_LAST_SEEN_KEY);
       const n = raw ? parseInt(raw, 10) : 0;
       return Number.isFinite(n) ? n : 0;
     } catch {
@@ -539,7 +543,7 @@ function App() {
   }
   function setLastNotifiedMs(ms: number) {
     try {
-      localStorage.setItem(NOTIFY_KEY, String(ms));
+      localStorage.setItem(NOTIFY_LAST_SEEN_KEY, String(ms));
     } catch {}
   }
 

@@ -2,6 +2,7 @@ import { Accessor, createEffect } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { showToast } from "../toast";
 import { composeFingerprint, isComposeEmpty } from "../composeHelpers";
+import { DRAFT_AUTOSAVE_DEBOUNCE_MS } from "../constants";
 import { extractEmailAddresses } from "../utils";
 import { settings } from "../settings";
 import type { ComposeState } from "../types";
@@ -43,7 +44,7 @@ export function useDraftAutosave(
 
   function scheduleDraftSave() {
     if (draftSaveTimer !== undefined) clearTimeout(draftSaveTimer);
-    draftSaveTimer = window.setTimeout(saveDraftNow, 1500);
+    draftSaveTimer = window.setTimeout(saveDraftNow, DRAFT_AUTOSAVE_DEBOUNCE_MS);
   }
 
   async function saveDraftNow() {

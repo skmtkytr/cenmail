@@ -62,7 +62,8 @@ export const DEFAULT_SETTINGS: Settings = {
   },
 };
 
-const STORAGE_KEY = "cenmail:settings";
+import { SETTINGS_STORAGE_KEY } from "./constants";
+const STORAGE_KEY = SETTINGS_STORAGE_KEY;
 
 function mergeDefaults(partial: unknown): Settings {
   // Shallow-merge each section so new fields added later still get defaults.

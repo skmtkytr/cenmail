@@ -56,8 +56,10 @@ const HOUR_PX_DEFAULT = 44;
 const HOUR_PX_MIN = 24;
 const HOUR_PX_MAX = 120;
 const HOUR_PX_STEP = 8;
-const HOUR_PX_STORAGE = "cenmail:calendar-hour-px";
-const VIEW_STORAGE = "cenmail:calendar-view";
+import {
+  CALENDAR_HOUR_PX_KEY as HOUR_PX_STORAGE,
+  CALENDAR_VIEW_KEY as VIEW_STORAGE,
+} from "./constants";
 
 function loadHourPx(): number {
   try {
