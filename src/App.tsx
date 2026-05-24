@@ -38,27 +38,26 @@ import {
   type SyncProgress,
   type SyncState,
 } from "./types";
-import { ToastContainer, showToast, triggerLastAction } from "./toast";
+import { ToastContainer, showToast } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
 import { settings, notificationsEnabledFor, updateSettings } from "./settings";
 import {
   bodyWithSignature,
   isComposeEmpty as isComposeEmptyHelper,
 } from "./composeHelpers";
-import { isEditableTarget as isEditableTargetHelper } from "./keyboardHelpers";
 import { useDraftAutosave } from "./hooks/useDraftAutosave";
 import { useSendUndo } from "./hooks/useSendUndo";
 import { useTriage } from "./hooks/useTriage";
+import { useContextMenu } from "./hooks/useContextMenu";
+import { useSelection } from "./hooks/useSelection";
+import { useCommandPalette } from "./hooks/useCommandPalette";
+import { useShortcuts } from "./hooks/useShortcuts";
 import { SettingsModal } from "./settingsModal";
 import { ScheduledSendsModal } from "./scheduledSendsModal";
 import { CalendarPane } from "./calendarPane";
 import { ShortcutsHelpModal } from "./shortcutsHelp";
 import { ContextMenu, type TriageActions } from "./contextMenu";
-import {
-  CommandPalette,
-  useCmdKHotkey,
-  type Command,
-} from "./commandPalette";
+import { CommandPalette, type Command } from "./commandPalette";
 import { ComposeModal } from "./composeModal";
 import { MessagePreview } from "./messagePreview";
 import { MessageList } from "./messageList";
@@ -142,9 +141,6 @@ function App() {
   const [selectedFolder, setSelectedFolder] = createSignal("inbox");
   const [selectedAccount, setSelectedAccount] =
     createSignal<AccountSelection>("all");
-  const [selectedMessageId, setSelectedMessageId] = createSignal<string | null>(
-    null,
-  );
   const [messageDetail, setMessageDetail] = createSignal<MessageDetail | null>(
     null,
   );
@@ -200,66 +196,27 @@ function App() {
   let searchDebounce: number | undefined;
   let searchInputRef: HTMLInputElement | undefined;
 
-  const [selectedIds, setSelectedIds] = createSignal<Set<string>>(new Set());
-  const [anchorId, setAnchorId] = createSignal<string | null>(null);
-
-  function isSelected(id: string): boolean {
-    return selectedIds().has(id);
-  }
-
-  function clearMultiSelect() {
-    setSelectedIds(new Set<string>());
-    setAnchorId(null);
-  }
-
-  function selectedMessages(): MessageMeta[] {
-    const ids = selectedIds();
-    if (ids.size === 0) return [];
-    return (messages() ?? []).filter((m) => ids.has(m.id));
-  }
-
-  function selectionTargets(fallback: MessageMeta | null): MessageMeta[] {
-    const multi = selectedMessages();
-    if (multi.length > 1) return multi;
-    if (fallback) return [fallback];
-    if (multi.length === 1) return multi;
-    return [];
-  }
-
-  function handleListClick(e: MouseEvent, message: MessageMeta) {
-    const list = visibleMessages() ?? [];
-    if (e.shiftKey && anchorId()) {
-      e.preventDefault();
-      const i = list.findIndex((m) => m.id === anchorId());
-      const j = list.findIndex((m) => m.id === message.id);
-      if (i >= 0 && j >= 0) {
-        const [a, b] = i < j ? [i, j] : [j, i];
-        const range = list.slice(a, b + 1).map((m) => m.id);
-        setSelectedIds(new Set(range));
-        setSelectedMessageId(message.id);
-      }
-      return;
-    }
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      const next = new Set(selectedIds());
-      if (next.has(message.id)) next.delete(message.id);
-      else next.add(message.id);
-      setSelectedIds(next);
-      setAnchorId(message.id);
-      if (next.size === 1) {
-        const only = list.find((m) => next.has(m.id));
-        if (only) void selectMessage(only);
-      } else if (next.size === 0) {
-        setSelectedMessageId(null);
-        setMessageDetail(null);
-      }
-      return;
-    }
-    setSelectedIds(new Set([message.id]));
-    setAnchorId(message.id);
-    void selectMessage(message);
-  }
+  // Selection state + helpers (single + multi + range + context-fan-out)
+  // live in useSelection.
+  const selection = useSelection({
+    visibleMessages: () => visibleMessages() ?? [],
+    selectMessage: (m) => selectMessage(m),
+    setMessageDetail,
+  });
+  const {
+    selectedMessageId,
+    setSelectedMessageId,
+    selectedIds,
+    setSelectedIds,
+    setAnchorId,
+    isSelected,
+    selectionTargets,
+    contextTargets,
+    clearMultiSelect,
+    handleListClick,
+    moveSelection,
+    currentMessage,
+  } = selection;
 
   async function loadMessages(
     sel: AccountSelection,
@@ -995,29 +952,7 @@ function App() {
     clearDraft,
   );
 
-  const [contextMenu, setContextMenu] = createSignal<{
-    x: number;
-    y: number;
-    message: MessageMeta;
-  } | null>(null);
-
-  function closeContextMenu() {
-    setContextMenu(null);
-  }
-
-  function openContextMenu(e: MouseEvent, message: MessageMeta) {
-    e.preventDefault();
-    setContextMenu({ x: e.clientX, y: e.clientY, message });
-  }
-
-  // Right-clicking a row that is part of an active multi-select should
-  // fan the action out to every selected row; right-clicking an
-  // unselected row keeps the single-row behaviour.
-  function contextTargets(m: MessageMeta): MessageMeta[] {
-    const ids = selectedIds();
-    if (ids.size > 1 && ids.has(m.id)) return selectedMessages();
-    return [m];
-  }
+  const { contextMenu, openContextMenu, closeContextMenu } = useContextMenu();
 
   const triageActions: TriageActions = {
     toggleRead: (m) => {
@@ -1060,9 +995,8 @@ function App() {
   };
 
   const [showShortcuts, setShowShortcuts] = createSignal(false);
-  const [paletteOpen, setPaletteOpen] = createSignal(false);
   const [scheduledOpen, setScheduledOpen] = createSignal(false);
-  useCmdKHotkey(() => setPaletteOpen((v) => !v));
+  const { paletteOpen, setPaletteOpen } = useCommandPalette();
 
   // Build the palette command list on demand. Returning [] when the
   // palette is closed means Solid only tracks (and rebuilds on) the
@@ -1251,222 +1185,39 @@ function App() {
     return cmds;
   });
 
-  function currentMessage(): MessageMeta | null {
-    const id = selectedMessageId();
-    if (!id) return null;
-    return (messages() ?? []).find((m) => m.id === id) ?? null;
-  }
-
-  function moveSelection(delta: number) {
-    const list = visibleMessages() ?? [];
-    if (list.length === 0) return;
-    const id = selectedMessageId();
-    const idx = id ? list.findIndex((m) => m.id === id) : -1;
-    let next = idx + delta;
-    if (idx < 0) next = delta > 0 ? 0 : list.length - 1;
-    next = Math.max(0, Math.min(list.length - 1, next));
-    const target = list[next];
-    if (target) void selectMessage(target);
-  }
-
-  const isEditableTarget = isEditableTargetHelper;
-
-  function handleShortcut(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      if (showShortcuts()) {
-        setShowShortcuts(false);
-        return;
-      }
-      if (contextMenu()) {
-        closeContextMenu();
-        return;
-      }
-      if (compose()) {
-        closeCompose();
-        return;
-      }
-      if (selectedIds().size > 1) {
-        clearMultiSelect();
-        return;
-      }
-      if (selectedMessageId()) {
-        setSelectedMessageId(null);
-        setMessageDetail(null);
-        clearMultiSelect();
-        return;
-      }
-    }
-    // Global re-sync: Ctrl/Cmd + Shift + R. Placed before the editable-target
-    // bail so it works even when the search field has focus.
-    if (
-      (e.ctrlKey || e.metaKey) &&
-      e.shiftKey &&
-      e.key.toLowerCase() === "r"
-    ) {
-      e.preventDefault();
-      handleRefresh();
-      return;
-    }
-    // Global view switch: Ctrl+Shift+1 (Mail) / Ctrl+Shift+2 (Calendar).
-    if (
-      (e.ctrlKey || e.metaKey) &&
-      e.shiftKey &&
-      (e.key === "1" || e.key === "!")
-    ) {
-      e.preventDefault();
-      setViewMode("mail");
-      return;
-    }
-    if (
-      (e.ctrlKey || e.metaKey) &&
-      e.shiftKey &&
-      (e.key === "2" || e.key === "@")
-    ) {
-      e.preventDefault();
-      setViewMode("calendar");
-      return;
-    }
-
-    if (isEditableTarget(e.target)) return;
-
-    // Ctrl/Cmd+Z fires the most recent undoable toast (archive, snooze, etc.).
-    // Placed after the editable-target bail so native text undo in compose
-    // still works.
-    if (
-      (e.ctrlKey || e.metaKey) &&
-      !e.shiftKey &&
-      e.key.toLowerCase() === "z"
-    ) {
-      if (triggerLastAction()) {
-        e.preventDefault();
-      }
-      return;
-    }
-
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
-      if (compose() || showShortcuts()) return;
-      e.preventDefault();
-      const list = visibleMessages() ?? [];
-      setSelectedIds(new Set(list.map((m) => m.id)));
-      if (list.length > 0) setAnchorId(list[0].id);
-      return;
-    }
-
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (compose() || showShortcuts()) return;
-
-    // Mail-only shortcuts must not fire in calendar view — pressing 'm'
-    // there would mute the previously-selected mail thread, 'e' would
-    // archive it, etc. Keep compose (c) and shortcut help (?) alive
-    // because they make sense from any view.
-    const calendarPassthrough = e.key === "c" || e.key === "?";
-    if (viewMode() !== "mail" && !calendarPassthrough) return;
-
-    const m = currentMessage();
-    const bulk = () => selectionTargets(m);
-    switch (e.key) {
-      case "j":
-      case "ArrowDown":
-        e.preventDefault();
-        moveSelection(1);
-        break;
-      case "k":
-      case "ArrowUp":
-        e.preventDefault();
-        moveSelection(-1);
-        break;
-      case "e": {
-        const targets = bulk().filter((t) =>
-          t.label_ids.includes("INBOX"),
-        );
-        if (targets.length > 0) {
-          e.preventDefault();
-          archiveWithUndo(targets);
-        }
-        break;
-      }
-      case "#":
-      case "Delete": {
-        const targets = bulk();
-        if (targets.length > 0) {
-          e.preventDefault();
-          trashWithUndo(targets);
-        }
-        break;
-      }
-      case "s": {
-        const targets = bulk();
-        if (targets.length > 0) {
-          e.preventDefault();
-          starToggleWithUndo(targets);
-        }
-        break;
-      }
-      case "z": {
-        const targets = bulk();
-        if (targets.length > 0) {
-          e.preventDefault();
-          void snoozeMessages(targets, snoozePresets()[0].fireAt);
-        }
-        break;
-      }
-      case "m": {
-        if (m) {
-          e.preventDefault();
-          void muteThreadAction(m);
-        }
-        break;
-      }
-      case "u": {
-        const targets = bulk();
-        if (targets.length > 0) {
-          e.preventDefault();
-          const allUnread = targets.every((t) => t.unread);
-          batch(() => {
-            for (const t of targets) {
-              void modifyLabels(
-                t,
-                allUnread ? [] : ["UNREAD"],
-                allUnread ? ["UNREAD"] : [],
-              );
-            }
-          });
-        }
-        break;
-      }
-      case "r":
-        if (m && messageDetail()) {
-          e.preventDefault();
-          openReply(false);
-        }
-        break;
-      case "a":
-        if (m && messageDetail()) {
-          e.preventDefault();
-          openReply(true);
-        }
-        break;
-      case "f":
-        if (m && messageDetail()) {
-          e.preventDefault();
-          openForward();
-        }
-        break;
-      case "c":
-        e.preventDefault();
-        openCompose();
-        break;
-      case "/":
-        e.preventDefault();
-        searchInputRef?.focus();
-        searchInputRef?.select();
-        break;
-      case "?":
-        e.preventDefault();
-        setShowShortcuts(true);
-        break;
-    }
-  }
+  const handleShortcut = useShortcuts({
+    showShortcuts,
+    setShowShortcuts,
+    contextMenu,
+    closeContextMenu,
+    compose,
+    closeCompose: () => closeCompose(),
+    selectedIds,
+    setSelectedIds,
+    setAnchorId,
+    selectedMessageId,
+    setSelectedMessageId,
+    setMessageDetail,
+    clearMultiSelect,
+    currentMessage,
+    selectionTargets,
+    visibleMessages: () => visibleMessages() ?? [],
+    moveSelection,
+    viewMode,
+    setViewMode,
+    handleRefresh,
+    archiveWithUndo,
+    trashWithUndo,
+    snoozeMessages,
+    muteThreadAction,
+    starToggleWithUndo,
+    modifyLabels,
+    messageDetail,
+    openReply,
+    openForward,
+    openCompose,
+    searchInputRef: () => searchInputRef,
+  });
 
   onMount(() => {
     const onDocClick = () => closeContextMenu();
