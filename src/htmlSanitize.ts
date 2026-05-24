@@ -249,10 +249,16 @@ const LINK_INTERCEPT_SCRIPT = `
       m.textContent = labels[i].toUpperCase();
       // !important across the board so the email's own stylesheet
       // can't drag the marker out of view via cascade.
+      // Position in document coords (rect is viewport-relative; add the
+      // current scroll offset) and use absolute, not fixed, so the
+      // marker scrolls along with its anchor instead of staying pinned
+      // to the viewport when the user moves through the message.
+      var docX = v.rect.left + (window.scrollX || window.pageXOffset || 0);
+      var docY = v.rect.top + (window.scrollY || window.pageYOffset || 0);
       var s = m.style;
-      s.setProperty('position', 'fixed', 'important');
-      s.setProperty('left', Math.max(0, v.rect.left) + 'px', 'important');
-      s.setProperty('top', Math.max(0, v.rect.top) + 'px', 'important');
+      s.setProperty('position', 'absolute', 'important');
+      s.setProperty('left', docX + 'px', 'important');
+      s.setProperty('top', docY + 'px', 'important');
       s.setProperty('background', '#fef08a', 'important');
       s.setProperty('color', '#111', 'important');
       s.setProperty('border', '1px solid #b45309', 'important');
