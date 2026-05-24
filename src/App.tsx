@@ -859,18 +859,26 @@ function App() {
     });
   }
 
-  function notSpam(message: MessageMeta) {
-    applyLocalLabelChange(message, ["INBOX"], ["SPAM"]);
-    void invoke("modify_message", {
-      email: message.account_email,
-      messageId: message.id,
-      addLabels: ["INBOX"],
-      removeLabels: ["SPAM"],
-    }).catch((err) => {
-      showToast({ message: `Restore failed: ${err}`, variant: "error" });
-      reloadAllVisible();
+  function notSpam(targets: MessageMeta[]) {
+    if (targets.length === 0) return;
+    for (const t of targets) {
+      applyLocalLabelChange(t, ["INBOX"], ["SPAM"]);
+      void invoke("modify_message", {
+        email: t.account_email,
+        messageId: t.id,
+        addLabels: ["INBOX"],
+        removeLabels: ["SPAM"],
+      }).catch((err) => {
+        showToast({ message: `Restore failed: ${err}`, variant: "error" });
+        reloadAllVisible();
+      });
+    }
+    showToast({
+      message:
+        targets.length === 1
+          ? "Moved out of Spam"
+          : `Moved ${targets.length} out of Spam`,
     });
-    showToast({ message: "Moved out of Spam" });
   }
 
   function starToggleWithUndo(targets: MessageMeta[]) {
@@ -1540,22 +1548,47 @@ function App() {
     setContextMenu({ x: e.clientX, y: e.clientY, message });
   }
 
+  // Right-clicking a row that is part of an active multi-select should
+  // fan the action out to every selected row; right-clicking an
+  // unselected row keeps the single-row behaviour.
+  function contextTargets(m: MessageMeta): MessageMeta[] {
+    const ids = selectedIds();
+    if (ids.size > 1 && ids.has(m.id)) return selectedMessages();
+    return [m];
+  }
+
   const triageActions: TriageActions = {
-    toggleRead: (m) =>
-      void modifyLabels(
-        m,
-        m.unread ? [] : ["UNREAD"],
-        m.unread ? ["UNREAD"] : [],
-      ),
-    toggleStar: (m) => starToggleWithUndo([m]),
-    archive: (m) => archiveWithUndo([m]),
-    trash: (m) => trashWithUndo([m]),
-    restoreFromTrash: (m) => void modifyLabels(m, [], ["TRASH"]),
-    moveToInbox: (m) => void modifyLabels(m, ["INBOX"], []),
-    markSpam: (m) => spamWithUndo([m]),
-    notSpam: (m) => notSpam(m),
-    snooze: (m, fireAt) => void snoozeMessages([m], fireAt),
-    mute: (m) => void muteThreadAction(m),
+    toggleRead: (m) => {
+      const targets = contextTargets(m);
+      // Toggle direction matches the right-clicked row's state, so the
+      // menu label ("Mark as read" / "Mark as unread") matches what the
+      // bulk action does.
+      const wasUnread = m.unread;
+      for (const t of targets) {
+        void modifyLabels(
+          t,
+          wasUnread ? [] : ["UNREAD"],
+          wasUnread ? ["UNREAD"] : [],
+        );
+      }
+    },
+    toggleStar: (m) => starToggleWithUndo(contextTargets(m)),
+    archive: (m) => archiveWithUndo(contextTargets(m)),
+    trash: (m) => trashWithUndo(contextTargets(m)),
+    restoreFromTrash: (m) => {
+      for (const t of contextTargets(m)) void modifyLabels(t, [], ["TRASH"]);
+    },
+    moveToInbox: (m) => {
+      for (const t of contextTargets(m)) void modifyLabels(t, ["INBOX"], []);
+    },
+    markSpam: (m) => spamWithUndo(contextTargets(m)),
+    notSpam: (m) => notSpam(contextTargets(m)),
+    snooze: (m, fireAt) => void snoozeMessages(contextTargets(m), fireAt),
+    // mute is thread-scoped; firing per selected row hits each row's
+    // thread (typical: one per selection).
+    mute: (m) => {
+      for (const t of contextTargets(m)) void muteThreadAction(t);
+    },
   };
 
   const [showShortcuts, setShowShortcuts] = createSignal(false);
