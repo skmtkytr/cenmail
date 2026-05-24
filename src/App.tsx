@@ -43,6 +43,7 @@ import { ToastContainer, showToast, triggerLastAction } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
 import { settings, notificationsEnabledFor, updateSettings } from "./settings";
 import { SettingsModal } from "./settingsModal";
+import { ScheduledSendsModal } from "./scheduledSendsModal";
 import { CalendarPane } from "./calendarPane";
 import { ShortcutsHelpModal } from "./shortcutsHelp";
 import { ContextMenu, type TriageActions } from "./contextMenu";
@@ -771,6 +772,14 @@ function App() {
 
   async function snoozeMessages(targets: MessageMeta[], fireAtMs: number) {
     if (targets.length === 0) return;
+    // Snapshot of the message that was selected before the optimistic
+    // update kicked in. If the network call fails we restore it so the
+    // user can retry against the same row instead of the auto-advanced
+    // neighbour.
+    const prevSelectionId = selectedMessageId();
+    const prevSelectionMeta = prevSelectionId
+      ? targets.find((t) => t.id === prevSelectionId) ?? null
+      : null;
     const next = pickAutoAdvance(targets);
     // All optimistic cache mutations land in one render flush, so the
     // rows disappear together instead of one per Gmail round-trip.
@@ -796,6 +805,9 @@ function App() {
         variant: "error",
       });
       reloadAllVisible();
+      // Roll the selection back to where it was so retry lands on the
+      // intended row instead of the auto-advanced neighbour.
+      if (prevSelectionMeta) void selectMessage(prevSelectionMeta);
       return;
     }
     const when = new Date(fireAtMs);
@@ -1496,7 +1508,12 @@ function App() {
           },
         });
     send
-      .then(() => showToast({ message: "Sent" }))
+      .then(() => {
+        showToast({ message: "Sent" });
+        // Pull the new sent message into cache so it lands in Sent within
+        // a second or two instead of waiting for the next periodic sync.
+        void startSync(payload.from_account);
+      })
       .catch((err) =>
         showToast({ message: `Send failed: ${err}`, variant: "error" }),
       );
@@ -1636,6 +1653,7 @@ function App() {
 
   const [showShortcuts, setShowShortcuts] = createSignal(false);
   const [paletteOpen, setPaletteOpen] = createSignal(false);
+  const [scheduledOpen, setScheduledOpen] = createSignal(false);
   useCmdKHotkey(() => setPaletteOpen((v) => !v));
 
   // Build the palette command list from current state on each open. Cheap
@@ -1679,6 +1697,13 @@ function App() {
         group: "App",
         keywords: ["preferences", "options"],
         run: () => setSettingsOpen(true),
+      },
+      {
+        id: "show-scheduled-sends",
+        label: "Show scheduled sends",
+        group: "Mail",
+        keywords: ["queued", "schedule", "pending", "later"],
+        run: () => setScheduledOpen(true),
       },
       {
         id: "open-shortcuts",
@@ -1929,11 +1954,15 @@ function App() {
     switch (e.key) {
       case "j":
       case "ArrowDown":
+        // Calendar view doesn't have a message list; let the browser keep
+        // native scroll on arrow keys instead of swallowing them.
+        if (viewMode() !== "mail") return;
         e.preventDefault();
         moveSelection(1);
         break;
       case "k":
       case "ArrowUp":
+        if (viewMode() !== "mail") return;
         e.preventDefault();
         moveSelection(-1);
         break;
@@ -2210,6 +2239,10 @@ function App() {
         open={settingsOpen()}
         onClose={() => setSettingsOpen(false)}
         accounts={accounts() ?? []}
+      />
+      <ScheduledSendsModal
+        open={scheduledOpen()}
+        onClose={() => setScheduledOpen(false)}
       />
     </div>
   );
