@@ -283,11 +283,26 @@ function App() {
   // event per row in a bulk action). The optimistic update already shows
   // the post-action state; the reload is only here to pick up changes
   // from the CLI / other windows / timer-fired actions.
+  //
+  // OPTIMISTIC_QUIET_MS guards a flicker: rapid E-presses produce a stream
+  // of optimistic removals followed by in-flight backend modify_message
+  // calls. If the debounced reload fires while one of those backend writes
+  // hasn't hit the DB yet, list_messages SELECTs the row as still inbox=1
+  // and setMessageCache puts it back into the list — until the next
+  // round-trip kicks it back out. Defer the reload until the user has
+  // stopped triaging for a moment so the backend writes can settle.
+  const OPTIMISTIC_QUIET_MS = 1500;
   let changedReloadTimer: number | undefined;
   function scheduleChangedReload() {
     if (changedReloadTimer !== undefined) clearTimeout(changedReloadTimer);
     changedReloadTimer = window.setTimeout(() => {
       changedReloadTimer = undefined;
+      const sinceOp = Date.now() - triage.lastOptimisticAt();
+      if (sinceOp < OPTIMISTIC_QUIET_MS) {
+        // User is still triaging; re-arm and try again later.
+        scheduleChangedReload();
+        return;
+      }
       reloadCurrentList();
       void refreshUnreadCounts();
     }, MESSAGES_CHANGED_DEBOUNCE_MS);

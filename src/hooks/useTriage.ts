@@ -42,6 +42,11 @@ export type TriageHandle = {
   spamWithUndo: (targets: MessageMeta[]) => void;
   notSpam: (targets: MessageMeta[]) => void;
   starToggleWithUndo: (targets: MessageMeta[]) => void;
+  /// Wall-clock of the last optimistic cache mutation. The host's
+  /// debounced reload uses this to back off — a reload that fires
+  /// while a backend modify is still in flight will SELECT the old
+  /// state for that row and flicker it back into the list.
+  lastOptimisticAt: () => number;
 };
 
 /// Bulk triage actions (archive / trash / snooze / mute / spam / star /
@@ -50,6 +55,11 @@ export type TriageHandle = {
 /// disappear together instead of popping out one Gmail round-trip at
 /// a time.
 export function useTriage(deps: TriageDeps): TriageHandle {
+  // Updated on every optimistic mutation. Read by App's reload
+  // debounce so a burst of triage actions doesn't trigger a reload
+  // that races the in-flight backend writes.
+  let lastOptimisticAt = 0;
+
   function applyLocalLabelChange(
     message: MessageMeta,
     add: string[],
@@ -57,6 +67,7 @@ export function useTriage(deps: TriageDeps): TriageHandle {
   ) {
     const list = deps.getCache();
     if (!list) return;
+    lastOptimisticAt = Date.now();
     const newLabels = new Set(message.label_ids);
     for (const r of remove) newLabels.delete(r);
     for (const a of add) newLabels.add(a);
@@ -376,5 +387,6 @@ export function useTriage(deps: TriageDeps): TriageHandle {
     spamWithUndo,
     notSpam,
     starToggleWithUndo,
+    lastOptimisticAt: () => lastOptimisticAt,
   };
 }
