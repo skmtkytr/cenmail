@@ -60,6 +60,16 @@ export function useTriage(deps: TriageDeps): TriageHandle {
   // that races the in-flight backend writes.
   let lastOptimisticAt = 0;
 
+  // Serialize per-message-id modify invokes so back-to-back mutations
+  // for the same message (e.g. mark-read fired by auto-advance,
+  // followed immediately by archive from rapid E presses) don't race
+  // on Gmail's side. Two concurrent modify_message calls for the same
+  // id can return out-of-order responses; the older response carries
+  // the pre-change labelIds and overwrites the DB after the newer
+  // response landed — so the row ends up un-archived on disk and the
+  // wrong state survives a restart.
+  const modifyInflight = new Map<string, Promise<void>>();
+
   function applyLocalLabelChange(
     message: MessageMeta,
     add: string[],
@@ -95,16 +105,39 @@ export function useTriage(deps: TriageDeps): TriageHandle {
     remove: string[],
   ) {
     applyLocalLabelChange(message, add, remove);
+    const prev = modifyInflight.get(message.id);
+    const task = (async () => {
+      if (prev) {
+        // Wait for the previous modify on the same message to settle;
+        // its error (if any) has already been handled by its own task.
+        try {
+          await prev;
+        } catch {
+          /* swallow */
+        }
+      }
+      try {
+        await invoke("modify_message", {
+          email: message.account_email,
+          messageId: message.id,
+          addLabels: add,
+          removeLabels: remove,
+        });
+      } catch (err) {
+        deps.setMessagesError(String(err));
+        deps.reloadAllVisible();
+        throw err;
+      }
+    })();
+    modifyInflight.set(message.id, task);
     try {
-      await invoke("modify_message", {
-        email: message.account_email,
-        messageId: message.id,
-        addLabels: add,
-        removeLabels: remove,
-      });
-    } catch (err) {
-      deps.setMessagesError(String(err));
-      deps.reloadAllVisible();
+      await task;
+    } finally {
+      // Only clear if we're still the latest; otherwise a newer modify
+      // is waiting on us and will install its own task.
+      if (modifyInflight.get(message.id) === task) {
+        modifyInflight.delete(message.id);
+      }
     }
   }
 
