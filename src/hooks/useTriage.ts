@@ -18,7 +18,17 @@ export type TriageDeps = {
   setSelectedMessageId: (id: string | null) => void;
   setMessageDetail: (d: MessageDetail | null) => void;
   visibleMessages: () => MessageMeta[];
-  selectMessage: (m: MessageMeta) => Promise<void>;
+  /// `options.silent` skips the host's auto-mark-read invoke. Triage
+  /// auto-advance always passes silent so a rapid archive burst
+  /// doesn't queue mark-read modifies that race the real archive on
+  /// the same message_id (the older mark-read response overwrites
+  /// the DB with stale labels after the archive landed, and any
+  /// queued archive that hasn't fired yet is lost if the user closes
+  /// the app while waiting on the queue).
+  selectMessage: (
+    m: MessageMeta,
+    options?: { silent?: boolean },
+  ) => Promise<void>;
   reloadAllVisible: () => void;
   setMessagesError: (s: string | null) => void;
 };
@@ -194,7 +204,7 @@ export function useTriage(deps: TriageDeps): TriageHandle {
     batch(() => {
       for (const t of targets) void modifyLabels(t, [], ["INBOX"]);
     });
-    if (next && !deps.selectedMessageId()) void deps.selectMessage(next);
+    if (next && !deps.selectedMessageId()) void deps.selectMessage(next, { silent: true });
     showToast({
       message:
         targets.length === 1 ? "Archived" : `Archived ${targets.length}`,
@@ -215,7 +225,7 @@ export function useTriage(deps: TriageDeps): TriageHandle {
     batch(() => {
       for (const t of targets) void trashMessageAction(t);
     });
-    if (next && !deps.selectedMessageId()) void deps.selectMessage(next);
+    if (next && !deps.selectedMessageId()) void deps.selectMessage(next, { silent: true });
     showToast({
       message:
         targets.length === 1
@@ -240,7 +250,7 @@ export function useTriage(deps: TriageDeps): TriageHandle {
     batch(() => {
       for (const t of targets) applyLocalLabelChange(t, [], ["INBOX"]);
     });
-    if (next && !deps.selectedMessageId()) void deps.selectMessage(next);
+    if (next && !deps.selectedMessageId()) void deps.selectMessage(next, { silent: true });
     const results = await Promise.allSettled(
       targets.map((t) =>
         invoke("snooze_message", {
@@ -257,7 +267,7 @@ export function useTriage(deps: TriageDeps): TriageHandle {
         variant: "error",
       });
       deps.reloadAllVisible();
-      if (prevSelectionMeta) void deps.selectMessage(prevSelectionMeta);
+      if (prevSelectionMeta) void deps.selectMessage(prevSelectionMeta, { silent: true });
       return;
     }
     const when = new Date(fireAtMs);
@@ -331,7 +341,7 @@ export function useTriage(deps: TriageDeps): TriageHandle {
         });
       }
     });
-    if (next && !deps.selectedMessageId()) void deps.selectMessage(next);
+    if (next && !deps.selectedMessageId()) void deps.selectMessage(next, { silent: true });
     showToast({
       message:
         snapshot.length === 1

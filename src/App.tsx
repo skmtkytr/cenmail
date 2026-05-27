@@ -690,7 +690,10 @@ function App() {
     starToggleWithUndo,
   } = triage;
 
-  async function selectMessage(message: MessageMeta) {
+  async function selectMessage(
+    message: MessageMeta,
+    options?: { silent?: boolean },
+  ) {
     setSelectedMessageId(message.id);
     setSelectedIds(new Set([message.id]));
     setAnchorId(message.id);
@@ -702,7 +705,17 @@ function App() {
     // nowhere after triage. Hand focus back to the host explicitly.
     const active = document.activeElement;
     if (active instanceof HTMLIFrameElement) active.blur();
-    if (message.unread && settings().inbox.markAsReadOnOpen) {
+    // Auto-advance from triage (silent=true) skips the mark-read invoke
+    // — the user isn't reading this message, they're cycling through to
+    // archive the next one. Firing mark-read here queues a modify on
+    // the same message_id, which then races / blocks the user's next
+    // archive on Gmail. A real "open this message" (user click) still
+    // marks-read as before.
+    if (
+      !options?.silent &&
+      message.unread &&
+      settings().inbox.markAsReadOnOpen
+    ) {
       void modifyLabels(message, [], ["UNREAD"]);
     }
     try {
