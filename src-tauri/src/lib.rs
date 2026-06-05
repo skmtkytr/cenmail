@@ -72,6 +72,13 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        // Must be the first plugin. When the user relaunches cenmail while it
+        // is still resident in the tray, the second process exits and this
+        // callback fires in the running instance — reveal its window instead
+        // of spawning a duplicate (which would double the timer/tray/notifs).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -188,11 +195,19 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Reveal and focus the main window, restoring it if it was hidden/minimized.
+///
+/// On Wayland (KWin in particular) a plain `set_focus()` from a background
+/// context — e.g. the single-instance relaunch handoff — is dropped by the
+/// compositor's focus-stealing prevention, leaving the window visible but
+/// inactive (its titlebar buttons don't respond). Briefly toggling
+/// always-on-top forces the compositor to raise and activate it.
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
         let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_always_on_top(true);
         let _ = win.set_focus();
+        let _ = win.set_always_on_top(false);
     }
 }
 
