@@ -77,7 +77,7 @@ pub fn run() {
         // callback fires in the running instance — reveal its window instead
         // of spawning a duplicate (which would double the timer/tray/notifs).
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_main_window(app);
+            reveal_window_deferred(app);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -97,16 +97,24 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the main window hides it to the tray instead of exiting,
-            // so the background timer keeps syncing and firing notifications.
-            // The tray "Quit" item flips `quitting` first to allow a real exit.
+            // Closing the main window keeps it resident instead of exiting, so
+            // the background timer keeps syncing and firing notifications. The
+            // tray "Quit" item flips `quitting` first to allow a real exit.
+            //
+            // We *minimize* rather than hide(): on Wayland, hide() unmaps the
+            // surface and the compositor re-places it (KWin centers it) on the
+            // next show, losing the user's window position. Minimizing keeps
+            // the toplevel mapped so unminimize restores the same geometry.
+            // skip_taskbar drops the taskbar entry while it's tucked away
+            // (best-effort — Wayland compositors may ignore it).
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<AppState>();
                 let quitting = state.quitting.load(Ordering::Relaxed);
                 let close_to_tray = state.close_to_tray.load(Ordering::Relaxed);
                 if close_to_tray && !quitting {
                     api.prevent_close();
-                    let _ = window.hide();
+                    let _ = window.set_skip_taskbar(true);
+                    let _ = window.minimize();
                 }
             }
         })
@@ -169,7 +177,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "open" => show_main_window(app),
+            "open" => reveal_window_deferred(app),
             "quit" => {
                 let state = app.state::<AppState>();
                 state.quitting.store(true, Ordering::Relaxed);
@@ -184,7 +192,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_main_window(tray.app_handle());
+                reveal_window_deferred(tray.app_handle());
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -194,21 +202,32 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Reveal and focus the main window, restoring it if it was hidden/minimized.
-///
-/// On Wayland (KWin in particular) a plain `set_focus()` from a background
-/// context — e.g. the single-instance relaunch handoff — is dropped by the
-/// compositor's focus-stealing prevention, leaving the window visible but
-/// inactive (its titlebar buttons don't respond). Briefly toggling
-/// always-on-top forces the compositor to raise and activate it.
+/// Reveal and focus the main window, restoring it if it was minimized to the
+/// tray. Mirror of the close handler: undo skip_taskbar, then unminimize in
+/// place (which keeps the window's last position). Must run on the main thread.
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_skip_taskbar(false);
         let _ = win.unminimize();
         let _ = win.show();
-        let _ = win.set_always_on_top(true);
         let _ = win.set_focus();
-        let _ = win.set_always_on_top(false);
     }
+}
+
+/// Reveal the main window on the next event-loop tick instead of immediately.
+///
+/// The tray menu (and the relaunch handoff) fire their callback while a pointer
+/// grab is still held by the menu. Showing + activating the window during that
+/// grab leaves it visible but unable to receive input on KWin/Wayland — the
+/// titlebar's close button doesn't respond. Sleeping briefly lets the grab
+/// release, then we hop back to the main thread to touch the GTK window.
+fn reveal_window_deferred(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || show_main_window(&handle));
+    });
 }
 
 async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
