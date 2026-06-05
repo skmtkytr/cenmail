@@ -12,11 +12,7 @@ import { createStore } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import {
-  isPermissionGranted,
-  requestPermission,
-  sendNotification,
-} from "@tauri-apps/plugin-notification";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   cacheKey,
   classifyBucket,
@@ -33,6 +29,7 @@ import {
   type ComposeState,
   type MessageDetail,
   type MessageMeta,
+  type PendingOpen,
   type SyncDone,
   type SyncError,
   type SyncProgress,
@@ -40,7 +37,7 @@ import {
 } from "./types";
 import { ToastContainer, showToast } from "./toast";
 import { ConfirmHost, confirmModal } from "./modal";
-import { settings, notificationsEnabledFor, updateSettings } from "./settings";
+import { settings, updateSettings, pushRuntimePrefs } from "./settings";
 import {
   bodyWithSignature,
   isComposeEmpty as isComposeEmptyHelper,
@@ -68,7 +65,7 @@ import {
   DRAFT_STORAGE_KEY,
   LIST_RELOAD_DEBOUNCE_MS,
   MESSAGES_CHANGED_DEBOUNCE_MS,
-  NOTIFY_LAST_SEEN_KEY,
+  NOTIFY_OPEN_FRESHNESS_MS,
   PANE_DEFAULTS,
   PANE_MAX,
   PANE_MIN,
@@ -485,11 +482,10 @@ function App() {
         setSyncState(email, "total", total);
         setSyncState(email, "status", "done");
         // Sync brought new rows for this account → refresh whatever the user
-        // is looking at, then run the notification pass against the freshly
-        // populated cache.
+        // is looking at. New-mail notifications are fired by the Rust backend
+        // (so they work while the window is closed), not from here.
         reloadCurrentList();
         void refreshUnreadCounts();
-        void notifyForRecent();
       }),
     );
     unlistenFns.push(
@@ -526,90 +522,53 @@ function App() {
 
     // Backfill profile pictures for accounts saved before picture_url existed.
     void backfillAccountProfiles();
-    // Ensure notification permission is requested early; ignore failure.
-    void ensureNotificationPermission();
+    // Mirror notification + tray prefs to the backend so the timer can act on
+    // them while the window (and its localStorage) is closed.
+    void pushRuntimePrefs(settings());
+    // When the window regains focus after a backend notification, jump to the
+    // message it pointed at.
+    unlistenFns.push(
+      await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (focused) void openFromNotification();
+      }),
+    );
     // Seed the sidebar badges before the first sync completes.
     void refreshUnreadCounts();
     // Start background sync of all accounts on first load.
     void syncAll();
   });
 
-  async function ensureNotificationPermission(): Promise<boolean> {
+  // Deep-link from a backend notification: drain the pending target and, if it
+  // is fresh, switch to its account/inbox and select the message. Consumed on
+  // window focus so returning to the app (via the notification or the tray)
+  // lands on the new mail.
+  async function openFromNotification() {
+    let target: PendingOpen | null = null;
     try {
-      let granted = await isPermissionGranted();
-      if (!granted) {
-        const perm = await requestPermission();
-        granted = perm === "granted";
-      }
-      return granted;
+      target = await invoke<PendingOpen | null>("take_pending_open");
     } catch {
-      return false;
+      return;
     }
-  }
-
-  function getLastNotifiedMs(): number {
+    if (!target) return;
+    if (Date.now() - target.firedAtMs > NOTIFY_OPEN_FRESHNESS_MS) return;
+    const acct = (accounts() ?? []).find(
+      (a) => a.email === target!.accountEmail,
+    );
+    batch(() => {
+      setSelectedAccount(acct ? acct.id : "all");
+      setSelectedFolder("inbox");
+      setSelectedBucket("all");
+    });
     try {
-      const raw = localStorage.getItem(NOTIFY_LAST_SEEN_KEY);
-      const n = raw ? parseInt(raw, 10) : 0;
-      return Number.isFinite(n) ? n : 0;
-    } catch {
-      return 0;
-    }
-  }
-  function setLastNotifiedMs(ms: number) {
-    try {
-      localStorage.setItem(NOTIFY_LAST_SEEN_KEY, String(ms));
-    } catch {}
-  }
-
-  // Notification pass: fired explicitly after every sync:done. Pulls a fresh
-  // unread/personal list straight from the backend so we don't depend on
-  // which cache key the user happens to be viewing.
-  let notifyWarmedUp = false;
-  async function notifyForRecent() {
-    const lastSeen = getLastNotifiedMs();
-    let maxSeen = lastSeen;
-    const candidates: MessageMeta[] = [];
-    try {
-      const inbox = await invoke<MessageMeta[]>("list_messages", {
+      const list = await invoke<MessageMeta[]>("list_messages", {
+        email: target.accountEmail,
         folder: "inbox",
         limit: 200,
       });
-      for (const m of inbox) {
-        if (m.date_millis > maxSeen) maxSeen = m.date_millis;
-        if (!m.unread) continue;
-        if (m.date_millis <= lastSeen) continue;
-        if (!notificationsEnabledFor(m.account_email, classifyBucket(m))) {
-          continue;
-        }
-        candidates.push(m);
-      }
+      const meta = list.find((m) => m.id === target!.messageId);
+      if (meta) await selectMessage(meta);
     } catch {
-      return;
-    }
-    // First post-launch pass: swallow the inbox snapshot rather than
-    // notifying for every existing unread; record the high-water mark and
-    // bail.
-    if (!notifyWarmedUp) {
-      notifyWarmedUp = true;
-      if (maxSeen > lastSeen) setLastNotifiedMs(maxSeen);
-      return;
-    }
-    if (candidates.length === 0) return;
-    if (maxSeen > lastSeen) setLastNotifiedMs(maxSeen);
-    const granted = await ensureNotificationPermission();
-    if (!granted) return;
-    if (candidates.length === 1) {
-      const m = candidates[0];
-      sendNotification({
-        title: parseFromHeader(m.from).name,
-        body: m.subject || "(no subject)",
-      });
-    } else {
-      sendNotification({
-        title: "cenmail",
-        body: `${candidates.length} new messages`,
-      });
+      // best-effort: the window is already focused; nav is a nicety.
     }
   }
 

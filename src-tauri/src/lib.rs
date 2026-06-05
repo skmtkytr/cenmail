@@ -1,13 +1,16 @@
+pub mod classify;
 pub mod commands;
 pub mod config;
 pub mod constants;
 pub mod db;
 pub mod gcal;
 pub mod gmail;
+pub mod notify;
 mod oauth;
 pub mod secret;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,10 +19,12 @@ use tauri::Manager;
 
 use commands::{
     add_account, cancel_scheduled, create_event, delete_draft, delete_event, get_attachment,
-    get_message, get_thread, list_accounts, list_calendars, list_events_cached,
+    get_message, get_thread, list_accounts, list_calendars, list_events_cached, open_attachment,
+    save_attachment,
     list_messages, list_scheduled, list_snoozed, modify_message, mute_thread,
     refresh_account, remove_account, respond_to_event, respond_to_invite, save_draft,
-    schedule_send, send_draft, send_message, snooze_message, sync_account,
+    schedule_send, send_draft, send_message, set_runtime_prefs, snooze_message, sync_account,
+    take_pending_open,
     sync_calendar_events, trash_message, unmute_thread, unread_counts, unsnooze_message,
     untrash_message, update_event, AppState,
 };
@@ -60,13 +65,19 @@ pub fn run() {
         token_cache: Arc::new(gmail::auth::TokenCache::new()),
         http,
         last_sync_at: Mutex::new(HashMap::new()),
+        close_to_tray: AtomicBool::new(true),
+        quitting: AtomicBool::new(false),
+        notify_warmed: AtomicBool::new(false),
+        pending_open: Mutex::new(None),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .setup(|app| {
+            build_tray(app.handle())?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -77,6 +88,20 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the main window hides it to the tray instead of exiting,
+            // so the background timer keeps syncing and firing notifications.
+            // The tray "Quit" item flips `quitting` first to allow a real exit.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<AppState>();
+                let quitting = state.quitting.load(Ordering::Relaxed);
+                let close_to_tray = state.close_to_tray.load(Ordering::Relaxed);
+                if close_to_tray && !quitting {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             add_account,
@@ -89,6 +114,8 @@ pub fn run() {
             get_message,
             get_thread,
             get_attachment,
+            open_attachment,
+            save_attachment,
             modify_message,
             trash_message,
             untrash_message,
@@ -112,9 +139,61 @@ pub fn run() {
             create_event,
             update_event,
             delete_event,
+            set_runtime_prefs,
+            take_pending_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Build the system-tray icon with an Open / Quit menu. Left-clicking the icon
+/// reopens the window; "Quit" sets the `quitting` flag so the window-close
+/// handler lets the app actually exit.
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open_i = MenuItem::with_id(app, "open", "Open cenmail", true, None::<&str>)?;
+    let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open_i, &quit_i])?;
+
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("cenmail")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "quit" => {
+                let state = app.state::<AppState>();
+                state.quitting.store(true, Ordering::Relaxed);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+/// Reveal and focus the main window, restoring it if it was hidden/minimized.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
 }
 
 async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
@@ -234,5 +313,122 @@ async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
         }
     }
 
+    // New-mail notifications. Runs last so it sees rows written by syncs that
+    // completed earlier in this (or a prior) tick.
+    if let Err(e) = notify_new_mail(app) {
+        tracing::warn!(error = %format!("{e:#}"), "notification pass failed");
+    }
+
     Ok(())
+}
+
+/// Per-account new-mail notification pass. Reads each account's high-water mark
+/// from `notification_state`, finds unread inbox messages past it, and fires a
+/// coalesced OS notification for the ones the user's prefs allow. The first
+/// pass after launch only advances the high-water marks (warm-up) so we don't
+/// notify for mail that was already sitting in the inbox at startup.
+fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
+    use tauri_plugin_notification::NotificationExt;
+
+    let state = app.state::<AppState>();
+    let warmed = state.notify_warmed.load(Ordering::Relaxed);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    let prefs = {
+        let conn = state.db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+        commands::load_runtime_prefs(&conn)
+    };
+
+    let emails: Vec<String> = {
+        let conn = state.db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+        let mut stmt = conn.prepare("SELECT email FROM accounts")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    for email in emails {
+        let last = {
+            let conn = state.db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            conn.query_row(
+                "SELECT last_notified_ms FROM notification_state WHERE account_email = ?1",
+                params![email],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        };
+        let candidates = unread_inbox_since(&state, &email, last)?;
+        let outcome = notify::select_notifications(&prefs, &candidates, last);
+
+        if outcome.new_high_water > last {
+            let conn = state.db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            conn.execute(
+                "INSERT INTO notification_state (account_email, last_notified_ms)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(account_email) DO UPDATE SET last_notified_ms = ?2",
+                params![email, outcome.new_high_water],
+            )?;
+        }
+
+        if !warmed {
+            continue;
+        }
+        if let Some(content) = notify::format_notification(&outcome.to_notify) {
+            // Single-message notifications deep-link; coalesced ones just open
+            // the app (no unambiguous target).
+            if let [m] = outcome.to_notify.as_slice() {
+                if let Ok(mut guard) = state.pending_open.lock() {
+                    *guard = Some(commands::PendingOpen {
+                        account_email: m.account_email.clone(),
+                        message_id: m.id.clone(),
+                        fired_at_ms: now_ms,
+                    });
+                }
+            }
+            if let Err(e) = app
+                .notification()
+                .builder()
+                .title(content.title)
+                .body(content.body)
+                .show()
+            {
+                tracing::warn!(error = %format!("{e:#}"), "show notification failed");
+            }
+        }
+    }
+
+    state.notify_warmed.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Unread inbox messages for `email` newer than `since_ms`, oldest first.
+fn unread_inbox_since(
+    state: &tauri::State<'_, AppState>,
+    email: &str,
+    since_ms: i64,
+) -> anyhow::Result<Vec<crate::gmail::messages::MessageMeta>> {
+    use crate::gmail::messages::MessageMeta;
+    let conn = state.db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, account_email, thread_id, from_header, subject, snippet,
+                date_millis, unread, label_ids
+         FROM messages
+         WHERE account_email = ?1 AND unread = 1 AND has_inbox = 1
+               AND date_millis > ?2
+         ORDER BY date_millis ASC",
+    )?;
+    let rows = stmt.query_map(params![email, since_ms], |r| {
+        let labels_json: String = r.get(8)?;
+        Ok(MessageMeta {
+            id: r.get(0)?,
+            account_email: r.get(1)?,
+            thread_id: r.get(2)?,
+            from: r.get(3)?,
+            subject: r.get(4)?,
+            snippet: r.get(5)?,
+            date_millis: r.get(6)?,
+            unread: r.get::<_, i64>(7)? != 0,
+            label_ids: serde_json::from_str(&labels_json).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }

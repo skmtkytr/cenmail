@@ -78,6 +78,14 @@ export type SyncProgress = { email: string; fetched: number; total: number };
 export type SyncDone = { email: string; total: number };
 export type SyncError = { email: string; error: string };
 
+/// Deep-link target drained from the backend (`take_pending_open`) after a
+/// single-message notification fires.
+export type PendingOpen = {
+  accountEmail: string;
+  messageId: string;
+  firedAtMs: number;
+};
+
 export type SyncState = {
   fetched: number;
   total: number;

@@ -125,6 +125,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
             last_notified_ms   INTEGER NOT NULL DEFAULT 0
         );
 
+        -- Generic key/value store for settings the backend needs to read
+        -- while the GUI window (and its localStorage) may be closed. The
+        -- frontend mirrors the notification-relevant subset here via
+        -- `set_runtime_prefs`.
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS label_ids (
             account_email TEXT NOT NULL,
             label_name    TEXT NOT NULL,

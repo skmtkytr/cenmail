@@ -5,7 +5,6 @@
 // ── localStorage keys ────────────────────────────────────────────────
 
 export const DRAFT_STORAGE_KEY = "cenmail:compose-draft";
-export const NOTIFY_LAST_SEEN_KEY = "cenmail:last-notified-ms";
 export const SETTINGS_STORAGE_KEY = "cenmail:settings";
 export const CALENDAR_HOUR_PX_KEY = "cenmail:calendar-hour-px";
 export const CALENDAR_VIEW_KEY = "cenmail:calendar-view";
@@ -26,6 +25,11 @@ export const MESSAGES_CHANGED_DEBOUNCE_MS = 300;
 
 /// Re-arm the search query after the user stops typing.
 export const SEARCH_DEBOUNCE_MS = 200;
+
+/// A notification's deep-link target is only honoured if the window regains
+/// focus within this window of the notification firing — older targets are
+/// treated as stale (the user came back for some other reason).
+export const NOTIFY_OPEN_FRESHNESS_MS = 30_000;
 
 // ── Virtualized list ─────────────────────────────────────────────────
 

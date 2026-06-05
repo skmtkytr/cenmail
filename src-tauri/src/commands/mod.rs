@@ -2,6 +2,7 @@ mod accounts;
 mod auth;
 mod calendar;
 mod compose;
+mod prefs;
 mod scheduled;
 mod snooze;
 
@@ -17,6 +18,10 @@ pub use compose::{
     delete_draft, fire_scheduled_send, save_draft, send_draft, send_message,
     OutgoingAttachment, SaveDraftRequest, SendRequest,
 };
+pub use prefs::{
+    load_runtime_prefs, set_runtime_prefs, take_pending_open, NotificationPrefs,
+    PendingOpen, RuntimePrefs,
+};
 pub use scheduled::{
     cancel_scheduled, list_scheduled, schedule_send, ScheduleSendRequest,
     ScheduledRow,
@@ -29,6 +34,7 @@ pub use snooze::{
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use rusqlite::{params, Connection};
+use std::sync::atomic::AtomicBool;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -58,6 +64,21 @@ pub struct AppState {
     /// background timer to decide whether an account is overdue for an
     /// incremental sync.
     pub last_sync_at: Mutex<HashMap<String, Instant>>,
+    /// When true, closing the window hides it to the tray instead of exiting.
+    /// Mirrors `runtime_prefs.close_to_tray`; updated by `set_runtime_prefs`.
+    pub close_to_tray: AtomicBool,
+    /// Set by the tray "Quit" action so the close handler lets the window
+    /// close for real instead of hiding it.
+    pub quitting: AtomicBool,
+    /// False until the first post-launch notification pass runs. The first
+    /// pass only advances the per-account high-water marks (so we don't flood
+    /// the user with notifications for mail that was already in the inbox at
+    /// startup); subsequent passes notify normally.
+    pub notify_warmed: AtomicBool,
+    /// The message a fresh single-message notification points at. The frontend
+    /// drains this (via `take_pending_open`) when the window regains focus, so
+    /// returning to the app after a notification jumps straight to the message.
+    pub pending_open: Mutex<Option<prefs::PendingOpen>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -841,9 +862,20 @@ pub async fn get_attachment(
     message_id: String,
     attachment_id: String,
 ) -> Result<String, String> {
-    let mid = message_id.clone();
-    let aid = attachment_id.clone();
-    with_token(&state, &email, move |http, token| {
+    attachment_base64(&state, &email, &message_id, &attachment_id).await
+}
+
+/// Fetch a single attachment's standard-base64 payload. Shared by the data-URL
+/// path (`get_attachment`) and the disk-writing paths (`open`/`save`).
+async fn attachment_base64(
+    state: &State<'_, AppState>,
+    email: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> Result<String, String> {
+    let mid = message_id.to_string();
+    let aid = attachment_id.to_string();
+    with_token(state, email, move |http, token| {
         let mid = mid.clone();
         let aid = aid.clone();
         Box::pin(async move {
@@ -852,9 +884,107 @@ pub async fn get_attachment(
     })
     .await
     .map_err(|e| {
-        tracing::error!(%email, %message_id, error = %format!("{e:#}"), "get_attachment failed");
+        tracing::error!(%email, %message_id, error = %format!("{e:#}"), "fetch attachment failed");
         format!("{e:#}")
     })
+}
+
+/// Decode a fetched attachment to raw bytes.
+async fn attachment_bytes(
+    state: &State<'_, AppState>,
+    email: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let b64 = attachment_base64(state, email, message_id, attachment_id).await?;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("decode attachment: {e}"))
+}
+
+/// Strip directory separators and parent refs so an attachment's declared
+/// filename can't escape the directory we write it into. Falls back to a
+/// generic name when nothing usable remains.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !matches!(c, '\0'..='\u{1f}'))
+        .collect();
+    let cleaned = cleaned.trim_matches('.').trim();
+    if cleaned.is_empty() {
+        "attachment".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// Write an attachment to a per-message cache dir and open it with the OS
+/// default application. Returns the path written.
+#[tauri::command]
+pub async fn open_attachment(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    message_id: String,
+    attachment_id: String,
+    filename: String,
+) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let bytes = attachment_bytes(&state, &email, &message_id, &attachment_id).await?;
+    let dir = dirs::data_local_dir()
+        .ok_or_else(|| "no data dir".to_string())?
+        .join("cenmail")
+        .join("attachments")
+        .join(sanitize_filename(&message_id));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create cache dir: {e}"))?;
+    let path = dir.join(sanitize_filename(&filename));
+    std::fs::write(&path, &bytes).map_err(|e| format!("write attachment: {e}"))?;
+    let path_str = path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(path_str.clone(), None::<&str>)
+        .map_err(|e| format!("open attachment: {e}"))?;
+    Ok(path_str)
+}
+
+/// Write an attachment to a caller-chosen path (from the native save dialog).
+#[tauri::command]
+pub async fn save_attachment(
+    state: State<'_, AppState>,
+    email: String,
+    message_id: String,
+    attachment_id: String,
+    dest_path: String,
+) -> Result<(), String> {
+    let bytes = attachment_bytes(&state, &email, &message_id, &attachment_id).await?;
+    std::fs::write(&dest_path, &bytes).map_err(|e| format!("save attachment: {e}"))
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn strips_path_separators() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("a/b/c.pdf"), "c.pdf");
+        assert_eq!(sanitize_filename("C:\\Windows\\evil.exe"), "evil.exe");
+    }
+
+    #[test]
+    fn falls_back_when_empty() {
+        assert_eq!(sanitize_filename(""), "attachment");
+        assert_eq!(sanitize_filename("   "), "attachment");
+        assert_eq!(sanitize_filename("/"), "attachment");
+        assert_eq!(sanitize_filename("..."), "attachment");
+    }
+
+    #[test]
+    fn keeps_normal_names() {
+        assert_eq!(sanitize_filename("invoice 2026.pdf"), "invoice 2026.pdf");
+    }
 }
 
 #[tauri::command]

@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import type { Bucket } from "./utils";
 
 export type ThemeMode = "system" | "light" | "dark";
@@ -33,6 +34,11 @@ export type Settings = {
     // calendar's `selected` flag from Google.
     visibility: Record<string, boolean>;
   };
+  general: {
+    // When true (default), closing the window hides it to the system tray and
+    // the app keeps running in the background; false quits on close.
+    closeToTray: boolean;
+  };
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -59,6 +65,9 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   calendar: {
     visibility: {},
+  },
+  general: {
+    closeToTray: true,
   },
 };
 
@@ -101,6 +110,7 @@ function mergeDefaults(partial: unknown): Settings {
         ...(p.calendar?.visibility ?? {}),
       },
     },
+    general: { ...DEFAULT_SETTINGS.general, ...(p.general ?? {}) },
   };
 }
 
@@ -124,6 +134,28 @@ export function updateSettings(updater: (prev: Settings) => Settings) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch {}
+  void pushRuntimePrefs(next);
+}
+
+/// Mirror the backend-relevant subset of settings (notification gating +
+/// close-to-tray) into the SQLite-backed runtime prefs the Rust timer reads
+/// while the window is closed. Best-effort: ignore failures (e.g. when not
+/// running under Tauri, in tests).
+export async function pushRuntimePrefs(s: Settings): Promise<void> {
+  try {
+    await invoke("set_runtime_prefs", {
+      prefs: {
+        notifications: {
+          enabled: s.notifications.enabled,
+          buckets: s.notifications.buckets,
+          perAccount: s.notifications.perAccount,
+        },
+        closeToTray: s.general.closeToTray,
+      },
+    });
+  } catch {
+    // best-effort
+  }
 }
 
 // Notification bucket filter helper.

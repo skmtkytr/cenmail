@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use cenmail_lib::{
+    classify::classify_bucket,
     commands::AppState,
     config::OAuthConfig,
     db,
@@ -263,6 +264,10 @@ fn build_state() -> Result<AppState> {
         token_cache: Arc::new(TokenCache::new()),
         http,
         last_sync_at: Mutex::new(std::collections::HashMap::new()),
+        close_to_tray: std::sync::atomic::AtomicBool::new(true),
+        quitting: std::sync::atomic::AtomicBool::new(false),
+        notify_warmed: std::sync::atomic::AtomicBool::new(false),
+        pending_open: Mutex::new(None),
     })
 }
 
@@ -367,78 +372,6 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
     let s = serde_json::to_string_pretty(v)?;
     println!("{s}");
     Ok(())
-}
-
-fn classify_bucket_for(m: &MessageMeta) -> &'static str {
-    let has = |l: &str| m.label_ids.iter().any(|x| x == l);
-    if has("CATEGORY_PROMOTIONS") || has("CATEGORY_UPDATES") || has("CATEGORY_FORUMS") {
-        return "newsletters";
-    }
-    if has("CATEGORY_SOCIAL") {
-        return "notifications";
-    }
-    let from_lower = m.from.to_lowercase();
-    let local = from_lower
-        .split('<')
-        .last()
-        .unwrap_or(&from_lower)
-        .split('@')
-        .next()
-        .unwrap_or("")
-        .trim_matches(|c: char| c == '"' || c.is_whitespace())
-        .to_string();
-    for k in [
-        "no-reply",
-        "noreply",
-        "no_reply",
-        "donotreply",
-        "do-not-reply",
-        "do_not_reply",
-        "notification",
-        "notifications",
-        "alert",
-        "alerts",
-        "mailer-daemon",
-        "mailerdaemon",
-        "postmaster",
-        "bounce",
-        "bounces",
-        "automated",
-    ] {
-        if local == k
-            || local.starts_with(&format!("{k}-"))
-            || local.starts_with(&format!("{k}_"))
-            || local.ends_with(&format!("-{k}"))
-            || local.ends_with(&format!("_{k}"))
-        {
-            return "notifications";
-        }
-    }
-    for k in [
-        "newsletter",
-        "newsletters",
-        "news",
-        "digest",
-        "updates",
-        "marketing",
-        "promo",
-        "promotions",
-        "info",
-        "hello",
-        "hi",
-        "team",
-        "community",
-    ] {
-        if local == k
-            || local.starts_with(&format!("{k}-"))
-            || local.starts_with(&format!("{k}_"))
-            || local.ends_with(&format!("-{k}"))
-            || local.ends_with(&format!("_{k}"))
-        {
-            return "newsletters";
-        }
-    }
-    "personal"
 }
 
 // ----- Read commands -----
@@ -581,7 +514,7 @@ fn cmd_list(
     let filtered: Vec<MessageMeta> = match bucket {
         Some(b) => rows
             .into_iter()
-            .filter(|m| classify_bucket_for(m) == b)
+            .filter(|m| classify_bucket(m) == b)
             .take(limit as usize)
             .collect(),
         None => rows,
@@ -782,7 +715,7 @@ fn cmd_classify(state: &AppState, email: &str, message_id: &str) -> Result<()> {
             })
         },
     )?;
-    println!("{}", classify_bucket_for(&row));
+    println!("{}", classify_bucket(&row));
     Ok(())
 }
 

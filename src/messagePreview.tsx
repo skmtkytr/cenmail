@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import { showToast } from "./toast";
 import { sanitizeMessageHtml } from "./htmlSanitize";
 import { parseFromHeader } from "./utils";
@@ -17,37 +18,44 @@ function formatBytes(n: number): string {
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
-// Browser-side base64 → blob. The backend returns standard base64 (padded);
-// we hand it straight to `atob` and copy into a Uint8Array.
-function base64ToBlob(b64: string, mime: string): Blob {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new Blob([bytes], { type: mime || "application/octet-stream" });
-}
-
-async function downloadAttachment(
+// Open an attachment with the OS default app. The backend fetches the bytes,
+// writes them to a cache dir, and hands the path to the system opener — the
+// blob/`<a download>` trick doesn't work inside the webview.
+async function openAttachment(
   accountEmail: string,
   messageId: string,
   att: Attachment,
 ) {
   try {
-    const b64 = await invoke<string>("get_attachment", {
+    await invoke("open_attachment", {
       email: accountEmail,
       messageId,
       attachmentId: att.attachment_id,
+      filename: att.filename || "attachment",
     });
-    const blob = base64ToBlob(b64, att.mime_type);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = att.filename || "attachment";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1_000);
   } catch (err) {
-    showToast({ message: `Download failed: ${err}`, variant: "error" });
+    showToast({ message: `Open failed: ${err}`, variant: "error" });
+  }
+}
+
+// Save an attachment to a user-chosen location via the native save dialog.
+async function saveAttachment(
+  accountEmail: string,
+  messageId: string,
+  att: Attachment,
+) {
+  try {
+    const dest = await save({ defaultPath: att.filename || "attachment" });
+    if (!dest) return; // user cancelled
+    await invoke("save_attachment", {
+      email: accountEmail,
+      messageId,
+      attachmentId: att.attachment_id,
+      destPath: dest,
+    });
+    showToast({ message: `Saved ${att.filename || "attachment"}` });
+  } catch (err) {
+    showToast({ message: `Save failed: ${err}`, variant: "error" });
   }
 }
 
@@ -178,28 +186,45 @@ function ThreadMessage(props: {
             <div class="flex shrink-0 flex-wrap gap-1.5 border-b border-[color:var(--color-border)] bg-[color:var(--color-bg)] px-6 py-2 text-xs">
               <For each={visibleAttachments()}>
                 {(att) => (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      downloadAttachment(
-                        props.accountEmail,
-                        props.detail.id,
-                        att,
-                      )
-                    }
-                    title={`Download ${att.filename || "attachment"}`}
-                    class="flex items-center gap-1.5 rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1 hover:bg-[color:var(--color-surface-hover)]"
-                  >
-                    <span aria-hidden="true">📎</span>
-                    <span class="max-w-48 truncate font-medium">
-                      {att.filename || "(unnamed)"}
-                    </span>
-                    <Show when={att.size > 0}>
-                      <span class="text-[color:var(--color-muted)]">
-                        {formatBytes(att.size)}
+                  <div class="flex items-stretch overflow-hidden rounded border border-[color:var(--color-border)] bg-[color:var(--color-surface)]">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openAttachment(
+                          props.accountEmail,
+                          props.detail.id,
+                          att,
+                        )
+                      }
+                      title={`Open ${att.filename || "attachment"}`}
+                      class="flex items-center gap-1.5 px-2 py-1 hover:bg-[color:var(--color-surface-hover)]"
+                    >
+                      <span aria-hidden="true">📎</span>
+                      <span class="max-w-48 truncate font-medium">
+                        {att.filename || "(unnamed)"}
                       </span>
-                    </Show>
-                  </button>
+                      <Show when={att.size > 0}>
+                        <span class="text-[color:var(--color-muted)]">
+                          {formatBytes(att.size)}
+                        </span>
+                      </Show>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        saveAttachment(
+                          props.accountEmail,
+                          props.detail.id,
+                          att,
+                        )
+                      }
+                      title={`Save ${att.filename || "attachment"}…`}
+                      aria-label={`Save ${att.filename || "attachment"}`}
+                      class="flex items-center border-l border-[color:var(--color-border)] px-1.5 text-[color:var(--color-muted)] hover:bg-[color:var(--color-surface-hover)] hover:text-[color:var(--color-fg)]"
+                    >
+                      <span aria-hidden="true">↓</span>
+                    </button>
+                  </div>
                 )}
               </For>
             </div>

@@ -142,6 +142,23 @@ export function SettingsModal(props: {
 
             <section>
               <h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-[color:var(--color-muted)]">
+                General
+              </h3>
+              <Field label="Keep running in the tray when window is closed">
+                <Toggle
+                  checked={settings().general.closeToTray}
+                  onChange={(v) =>
+                    updateSettings((s) => ({
+                      ...s,
+                      general: { ...s.general, closeToTray: v },
+                    }))
+                  }
+                />
+              </Field>
+            </section>
+
+            <section>
+              <h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-[color:var(--color-muted)]">
                 Appearance
               </h3>
               <Field label="Theme">
