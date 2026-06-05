@@ -104,13 +104,26 @@ You can `sqlite3` the cache directly for ad-hoc queries. The schema is in
 ```fish
 pnpm install
 pnpm app                                      # GUI dev (Tauri + Vite + 1Password env)
-cargo build --release --manifest-path src-tauri/Cargo.toml
+
+# Production GUI binary — MUST use `tauri build`, not plain `cargo build`.
+# A bare `cargo build --release` of the GUI compiles in Tauri *dev* mode, so the
+# webview loads `build.devUrl` (http://localhost:1420) instead of the embedded
+# `frontendDist`. The result launches but shows "Could not connect to localhost:
+# Connection refused" because no Vite server is running. `tauri build` compiles
+# in production mode (embeds dist) and runs `beforeBuildCommand` (pnpm build).
+pnpm tauri build --no-bundle                  # -> src-tauri/target/release/cenmail
 install -m 755 src-tauri/target/release/cenmail     ~/.local/bin/cenmail
+
+# The CLI has no webview, so it builds fine either way:
+cargo build --release --manifest-path src-tauri/Cargo.toml --bin cenmail-cli
 install -m 755 src-tauri/target/release/cenmail-cli ~/.local/bin/cenmail-cli
 ```
 
 The Cargo package has `default-run = "cenmail"` so plain `cargo run` targets
-the GUI. The CLI binary is at `src-tauri/src/bin/cli.rs`.
+the GUI (in dev mode — needs the Vite server). The CLI binary is at
+`src-tauri/src/bin/cli.rs`. For a quick compile-check of the whole workspace,
+`cargo build --manifest-path src-tauri/Cargo.toml` is fine; just don't ship the
+GUI binary it produces.
 
 ## Testing
 
