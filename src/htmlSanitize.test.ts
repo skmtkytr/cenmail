@@ -5,7 +5,7 @@ describe("sanitizeMessageHtml", () => {
   it("strips img src into data-cenmail-src when blocking images", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<img src="https://tracker/pixel.png" alt="x">',
-      { allowRemoteImages: false, dark: false },
+      { allowRemoteImages: false },
     );
     expect(blockedImages).toBe(1);
     expect(html).toContain("data-cenmail-src=\"https://tracker/pixel.png\"");
@@ -18,7 +18,7 @@ describe("sanitizeMessageHtml", () => {
   it("preserves data: image src", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<img src="data:image/png;base64,AAAA">',
-      { allowRemoteImages: false, dark: false },
+      { allowRemoteImages: false },
     );
     expect(blockedImages).toBe(0);
     expect(html).toContain('src="data:image/png;base64,AAAA"');
@@ -27,7 +27,7 @@ describe("sanitizeMessageHtml", () => {
   it("preserves cid: image src when no map is supplied", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<img src="cid:abc123">',
-      { allowRemoteImages: false, dark: false },
+      { allowRemoteImages: false },
     );
     expect(blockedImages).toBe(0);
     expect(html).toContain('src="cid:abc123"');
@@ -37,7 +37,6 @@ describe("sanitizeMessageHtml", () => {
     const dataUrl = "data:image/png;base64,AAAA";
     const { html } = sanitizeMessageHtml('<img src="cid:logo">', {
       allowRemoteImages: false,
-      dark: false,
       cidMap: { logo: dataUrl },
     });
     expect(html).toContain(`src="${dataUrl}"`);
@@ -48,7 +47,6 @@ describe("sanitizeMessageHtml", () => {
     const dataUrl = "data:image/png;base64,BBBB";
     const { html } = sanitizeMessageHtml('<img src="cid:LOGO">', {
       allowRemoteImages: false,
-      dark: false,
       cidMap: { logo: dataUrl },
     });
     expect(html).toContain(`src="${dataUrl}"`);
@@ -57,7 +55,7 @@ describe("sanitizeMessageHtml", () => {
   it("removes <base> and <link> tags so remote refs cannot leak", () => {
     const { html } = sanitizeMessageHtml(
       '<base href="https://evil/"><link rel="stylesheet" href="https://evil/x.css"><p>ok</p>',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     expect(html).not.toMatch(/<base/i);
     expect(html).not.toMatch(/<link/i);
@@ -67,7 +65,7 @@ describe("sanitizeMessageHtml", () => {
   it("does not block when allowRemoteImages is true", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<img src="https://tracker/pixel.png">',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     expect(blockedImages).toBe(0);
     expect(html).toContain('src="https://tracker/pixel.png"');
@@ -76,7 +74,7 @@ describe("sanitizeMessageHtml", () => {
   it("counts srcset urls as blocked too", () => {
     const { blockedImages } = sanitizeMessageHtml(
       '<img src="https://a/1.png" srcset="https://a/2.png 2x">',
-      { allowRemoteImages: false, dark: false },
+      { allowRemoteImages: false },
     );
     expect(blockedImages).toBe(1);
   });
@@ -84,7 +82,7 @@ describe("sanitizeMessageHtml", () => {
   it("rewrites anchors to target=_blank with safe rel", () => {
     const { html } = sanitizeMessageHtml(
       '<a href="https://example.com">link</a>',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     expect(html).toMatch(/target="_blank"/);
     expect(html).toMatch(/rel="noopener noreferrer"/);
@@ -93,7 +91,7 @@ describe("sanitizeMessageHtml", () => {
   it("strips javascript: href", () => {
     const { html } = sanitizeMessageHtml(
       '<a href="javascript:alert(1)">x</a>',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     // The <a> itself loses href (so a click does nothing). The literal
     // "javascript:" appears in the intercept script body, which is why
@@ -105,7 +103,7 @@ describe("sanitizeMessageHtml", () => {
   it("strips inline event handlers", () => {
     const { html } = sanitizeMessageHtml(
       '<div onclick="alert(1)">x</div>',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     expect(html).not.toMatch(/onclick/i);
   });
@@ -113,7 +111,7 @@ describe("sanitizeMessageHtml", () => {
   it("strips user-supplied scripts but keeps the link-intercept", () => {
     const { html } = sanitizeMessageHtml(
       '<p>ok</p><script>alert(1)</script>',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     // Payload is gone…
     expect(html).not.toMatch(/alert\(1\)/);
@@ -125,7 +123,7 @@ describe("sanitizeMessageHtml", () => {
   it("removes background-image url() from inline styles when blocking", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<div style="background-image:url(https://t/p.png)">x</div>',
-      { allowRemoteImages: false, dark: false },
+      { allowRemoteImages: false },
     );
     expect(blockedImages).toBeGreaterThan(0);
     expect(html).not.toMatch(/url\(\s*https:\/\//);
@@ -134,7 +132,7 @@ describe("sanitizeMessageHtml", () => {
   it("strips @import and remote url() from <style> bodies when blocking", () => {
     const { html, blockedImages } = sanitizeMessageHtml(
       '<style>@import url("https://t/x.css");body{background:url(https://t/y.png)}</style><p>ok</p>',
-      { allowRemoteImages: false, dark: false },
+      { allowRemoteImages: false },
     );
     expect(blockedImages).toBeGreaterThan(0);
     expect(html).not.toMatch(/@import/i);
@@ -147,31 +145,36 @@ describe("sanitizeMessageHtml", () => {
   it("keeps remote url() in <style> when images are allowed", () => {
     const { html } = sanitizeMessageHtml(
       '<style>body{background:url(https://t/y.png)}</style>',
-      { allowRemoteImages: true, dark: false },
+      { allowRemoteImages: true },
     );
     expect(html).toContain("url(https://t/y.png)");
   });
 
-  it("injects dark-mode style preamble when dark=true", () => {
-    const { html } = sanitizeMessageHtml(
-      "<p>body</p>",
-      { allowRemoteImages: true, dark: true },
-    );
-    expect(html).toMatch(/color-scheme:\s*dark/);
-  });
-
-  it("does not inject dark style when dark=false", () => {
+  it("always renders on a white page (light color-scheme + white bg)", () => {
     const { html } = sanitizeMessageHtml("<p>body</p>", {
       allowRemoteImages: true,
-      dark: false,
     });
+    expect(html).toMatch(/color-scheme:\s*light/);
+    expect(html).toMatch(/background:\s*#ffffff/i);
     expect(html).not.toMatch(/color-scheme:\s*dark/);
+  });
+
+  it("lets the email's own background override the white default", () => {
+    // BASE_STYLE is injected without !important and before the email's styles,
+    // so an explicit background in the email still wins.
+    const { html } = sanitizeMessageHtml(
+      "<style>body{background:#222}</style><p>body</p>",
+      { allowRemoteImages: true },
+    );
+    const baseIdx = html.indexOf("#ffffff");
+    const emailIdx = html.indexOf("#222");
+    expect(baseIdx).toBeGreaterThanOrEqual(0);
+    expect(emailIdx).toBeGreaterThan(baseIdx); // email style comes after base
   });
 
   it("returns a string for empty input", () => {
     const { html, blockedImages } = sanitizeMessageHtml("", {
       allowRemoteImages: false,
-      dark: false,
     });
     expect(typeof html).toBe("string");
     expect(blockedImages).toBe(0);

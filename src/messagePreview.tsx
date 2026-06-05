@@ -64,7 +64,6 @@ function ThreadMessage(props: {
   isLast: boolean;
   expanded: boolean;
   allowed: boolean;
-  prefersDark: boolean;
   accountEmail: string;
   onToggleExpanded: () => void;
   onShowImages: () => void;
@@ -124,7 +123,6 @@ function ThreadMessage(props: {
   const sanitized = createMemo(() =>
     sanitizeMessageHtml(props.detail.html_body ?? "", {
       allowRemoteImages: props.allowed,
-      dark: props.prefersDark,
       cidMap: cidMap(),
     }),
   );
@@ -258,12 +256,8 @@ function ThreadMessage(props: {
             <iframe
               srcdoc={sanitized().html}
               sandbox="allow-scripts allow-popups-to-escape-sandbox"
-              class={`w-full border-0 ${
+              class={`w-full border-0 bg-white ${
                 fillsRemaining() ? "min-h-0 flex-1" : "h-[60vh]"
-              } ${
-                props.prefersDark
-                  ? "bg-[color:var(--color-surface)]"
-                  : "bg-white"
               }`}
               style={{
                 transform: "translateZ(0)",
@@ -350,7 +344,6 @@ export function MessagePreview(props: {
   expandedInThread: Set<string>;
   allowImagesFor: Set<string>;
   alwaysAllowImages: boolean;
-  prefersDark: boolean;
   toggleThreadExpanded: (id: string) => void;
   setAllowImagesFor: (next: Set<string>) => void;
   onReply: (all: boolean) => void;
@@ -436,7 +429,6 @@ export function MessagePreview(props: {
                   allowed={
                     props.alwaysAllowImages || props.allowImagesFor.has(d.id)
                   }
-                  prefersDark={props.prefersDark}
                   accountEmail={props.currentMessageAccount}
                   onToggleExpanded={() => props.toggleThreadExpanded(d.id)}
                   onShowImages={() => {

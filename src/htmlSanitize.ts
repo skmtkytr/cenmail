@@ -1,6 +1,5 @@
 export type SanitizeOptions = {
   allowRemoteImages: boolean;
-  dark: boolean;
   /// Map of `Content-Id` (without the surrounding `<>`) to a `data:` URL
   /// containing the attachment bytes. Used to inline `cid:` images that
   /// would otherwise show as broken placeholders.
@@ -12,13 +11,15 @@ export type SanitizeResult = {
   blockedImages: number;
 };
 
-const DARK_STYLE = `
-  :root { color-scheme: dark; }
-  html, body {
-    background: #1a1a1a !important;
-    color: #f3f4f6 !important;
-  }
-  a { color: #60a5fa !important; }
+// HTML email is overwhelmingly authored for a white page with dark text, and
+// senders set text colors on inner elements without setting a matching
+// background. Forcing a dark page (as we used to) leaves that dark text on a
+// dark background — unreadable. So we always render the body on white, like
+// Gmail/Spark do even in dark mode. No `!important`: emails that DO set their
+// own background keep it, we only supply the default the sender assumed.
+const BASE_STYLE = `
+  :root { color-scheme: light; }
+  html, body { background: #ffffff; }
 `;
 
 // Schemes that don't fetch from the network and are safe to render.
@@ -147,12 +148,11 @@ export function sanitizeMessageHtml(
     }
   });
 
-  // Inject dark-mode preamble.
-  if (opts.dark) {
-    const style = doc.createElement("style");
-    style.textContent = DARK_STYLE;
-    doc.head.appendChild(style);
-  }
+  // Always render on a white page (see BASE_STYLE). Prepend so the email's own
+  // <style> blocks, which come later in <head>, still win when they set colors.
+  const baseStyle = doc.createElement("style");
+  baseStyle.textContent = BASE_STYLE;
+  doc.head.insertBefore(baseStyle, doc.head.firstChild);
 
   // Click intercept: the iframe runs in an opaque-origin sandbox (no
   // allow-same-origin), so it can't reach the host. It can still

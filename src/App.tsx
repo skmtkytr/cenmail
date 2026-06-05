@@ -72,20 +72,6 @@ import {
   SEARCH_DEBOUNCE_MS,
 } from "./constants";
 
-function usePrefersDark(): () => boolean {
-  const [dark, setDark] = createSignal(
-    typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-color-scheme: dark)").matches,
-  );
-  if (typeof window !== "undefined" && window.matchMedia) {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (e: MediaQueryListEvent) => setDark(e.matches);
-    mq.addEventListener("change", handler);
-  }
-  return dark;
-}
-
-
 function quoteForReply(detail: MessageDetail): string {
   const original = detail.text_body ?? stripHtml(detail.html_body ?? "");
   const lines = original.split(/\r?\n/).map((l) => `> ${l}`);
@@ -117,14 +103,6 @@ function readStoredWidth(key: keyof typeof PANE_DEFAULTS): number {
 }
 
 function App() {
-  const osPrefersDark = usePrefersDark();
-  // The user can override the OS preference in settings.
-  const prefersDark = () => {
-    const theme = settings().appearance.theme;
-    if (theme === "dark") return true;
-    if (theme === "light") return false;
-    return osPrefersDark();
-  };
   const [allowImagesFor, setAllowImagesFor] = createSignal<Set<string>>(
     new Set(),
   );
@@ -1351,7 +1329,6 @@ function App() {
         expandedInThread={expandedInThread()}
         allowImagesFor={allowImagesFor()}
         alwaysAllowImages={settings().privacy.alwaysAllowImages}
-        prefersDark={prefersDark()}
         toggleThreadExpanded={toggleThreadExpanded}
         setAllowImagesFor={setAllowImagesFor}
         onReply={openReply}
