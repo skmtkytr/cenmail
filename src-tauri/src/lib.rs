@@ -94,6 +94,31 @@ pub fn run() {
                     }
                 }
             });
+
+            // Tray residency keeps the process alive after the window closes,
+            // so we must exit promptly on termination signals — otherwise at
+            // logout/shutdown the session manager waits on us and force-kills,
+            // stalling the whole shutdown. Exit immediately; DB writes are
+            // already committed (rusqlite autocommit) and tokens live in the
+            // keyring, so there's nothing to flush.
+            #[cfg(unix)]
+            tauri::async_runtime::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (mut term, mut intr) = match (
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::interrupt()),
+                ) {
+                    (Ok(t), Ok(i)) => (t, i),
+                    _ => return,
+                };
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = intr.recv() => {}
+                }
+                tracing::info!("received termination signal; exiting");
+                std::process::exit(0);
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -362,8 +387,6 @@ async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
 /// pass after launch only advances the high-water marks (warm-up) so we don't
 /// notify for mail that was already sitting in the inbox at startup.
 fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
-    use tauri_plugin_notification::NotificationExt;
-
     let state = app.state::<AppState>();
     let warmed = state.notify_warmed.load(Ordering::Relaxed);
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -418,20 +441,43 @@ fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
                     });
                 }
             }
-            if let Err(e) = app
-                .notification()
-                .builder()
-                .title(content.title)
-                .body(content.body)
-                .show()
-            {
-                tracing::warn!(error = %format!("{e:#}"), "show notification failed");
-            }
+            show_notification(app, &content.title, &content.body);
         }
     }
 
     state.notify_warmed.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Fire a desktop notification.
+///
+/// On Linux we go straight to notify-rust instead of the Tauri plugin: the
+/// plugin omits the `desktop-entry` hint, so KDE/Plasma shows the toast but
+/// drops it from the notification history. Setting it to our installed
+/// `.desktop` id restores history retention and proper app identity/icon.
+fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        let title = title.to_string();
+        let body = body.to_string();
+        // show() blocks on a D-Bus round-trip; run it off the main thread.
+        tauri::async_runtime::spawn(async move {
+            let _ = notify_rust::Notification::new()
+                .summary(&title)
+                .body(&body)
+                .appname("cenmail")
+                .hint(notify_rust::Hint::DesktopEntry("dev.cenmail.app".to_string()))
+                .show();
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        if let Err(e) = app.notification().builder().title(title).body(body).show() {
+            tracing::warn!(error = %format!("{e:#}"), "show notification failed");
+        }
+    }
 }
 
 /// Unread inbox messages for `email` newer than `since_ms`, oldest first.

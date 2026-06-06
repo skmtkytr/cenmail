@@ -536,6 +536,7 @@ dependencies = [
  "hex",
  "humantime",
  "keyring",
+ "notify-rust",
  "oauth2",
  "rand 0.8.6",
  "reqwest 0.12.28",
