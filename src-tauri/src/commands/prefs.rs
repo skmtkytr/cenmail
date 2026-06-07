@@ -93,24 +93,6 @@ pub fn load_runtime_prefs(conn: &Connection) -> RuntimePrefs {
         .unwrap_or_default()
 }
 
-/// A pending deep-link: the message a just-fired single-message notification
-/// points at, plus when it fired so the frontend can ignore stale targets.
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingOpen {
-    pub account_email: String,
-    pub message_id: String,
-    pub fired_at_ms: i64,
-}
-
-/// Drain the pending deep-link target (if any). Called by the frontend when the
-/// window regains focus after a notification so it can jump to the message.
-#[tauri::command]
-pub fn take_pending_open(state: State<'_, AppState>) -> Result<Option<PendingOpen>, String> {
-    let mut guard = state.pending_open.lock().map_err(|e| e.to_string())?;
-    Ok(guard.take())
-}
-
 /// Persist the runtime prefs pushed from the frontend and update the live
 /// `close_to_tray` flag the window-close handler consults.
 #[tauri::command]

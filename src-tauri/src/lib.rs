@@ -24,7 +24,6 @@ use commands::{
     list_messages, list_scheduled, list_snoozed, modify_message, mute_thread,
     refresh_account, remove_account, respond_to_event, respond_to_invite, save_draft,
     schedule_send, send_draft, send_message, set_runtime_prefs, snooze_message, sync_account,
-    take_pending_open,
     sync_calendar_events, trash_message, unmute_thread, unread_counts, unsnooze_message,
     untrash_message, update_event, AppState,
 };
@@ -68,7 +67,6 @@ pub fn run() {
         close_to_tray: AtomicBool::new(true),
         quitting: AtomicBool::new(false),
         notify_warmed: AtomicBool::new(false),
-        pending_open: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -180,7 +178,6 @@ pub fn run() {
             update_event,
             delete_event,
             set_runtime_prefs,
-            take_pending_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -394,7 +391,6 @@ async fn timer_tick(app: &tauri::AppHandle) -> anyhow::Result<()> {
 fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
     let warmed = state.notify_warmed.load(Ordering::Relaxed);
-    let now_ms = chrono::Utc::now().timestamp_millis();
 
     let prefs = {
         let conn = state.db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
@@ -435,18 +431,16 @@ fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
             continue;
         }
         if let Some(content) = notify::format_notification(&outcome.to_notify) {
-            // Single-message notifications deep-link; coalesced ones just open
-            // the app (no unambiguous target).
-            if let [m] = outcome.to_notify.as_slice() {
-                if let Ok(mut guard) = state.pending_open.lock() {
-                    *guard = Some(commands::PendingOpen {
-                        account_email: m.account_email.clone(),
-                        message_id: m.id.clone(),
-                        fired_at_ms: now_ms,
-                    });
-                }
-            }
-            show_notification(app, &content.title, &content.body);
+            // Single-message notifications carry a deep-link target; coalesced
+            // ones (N new messages) just open the app, no unambiguous target.
+            let target = match outcome.to_notify.as_slice() {
+                [m] => Some(NotifyTarget {
+                    account_email: m.account_email.clone(),
+                    message_id: m.id.clone(),
+                }),
+                _ => None,
+            };
+            show_notification(app, &content.title, &content.body, target);
         }
     }
 
@@ -454,17 +448,30 @@ fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The message a single-message notification deep-links to. Emitted to the
+/// frontend as `notification:open` when the notification is clicked.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NotifyTarget {
+    account_email: String,
+    message_id: String,
+}
+
 /// Fire a desktop notification.
 ///
 /// On Linux we go straight to notify-rust instead of the Tauri plugin for two
 /// reasons: the plugin omits the `desktop-entry` hint (so KDE/Plasma drops the
 /// toast from its history), and it gives no way to react to a click. We attach
-/// a "default" action — invoked when the user clicks the notification body —
-/// and on click reveal the window. Revealing focuses it, which lets the
-/// frontend's focus listener drain `pending_open` and jump to the message.
-/// KDE hands an activation token to the action, so the raise actually works on
-/// Wayland (unlike a background set_focus).
-fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) {
+/// a "default" action — invoked when the user clicks the notification body — and
+/// on click reveal the window and emit `notification:open` with `target` so the
+/// frontend jumps to the message. KDE hands the action an activation token, so
+/// the raise works on Wayland (unlike a background set_focus).
+fn show_notification(
+    app: &tauri::AppHandle,
+    title: &str,
+    body: &str,
+    target: Option<NotifyTarget>,
+) {
     #[cfg(target_os = "linux")]
     {
         let app = app.clone();
@@ -490,8 +497,21 @@ fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) {
                                 if *name == "default" {
                                     tracing::info!("notification clicked; revealing window");
                                     let app2 = app.clone();
-                                    let _ = app
-                                        .run_on_main_thread(move || show_main_window(&app2));
+                                    // Raise the window, then tell the frontend
+                                    // which message to open. Emitting directly
+                                    // (rather than via a focus-drained pending
+                                    // slot) means the jump doesn't depend on a
+                                    // focus event firing.
+                                    let _ = app.run_on_main_thread(move || {
+                                        show_main_window(&app2);
+                                        if let Some(t) = target {
+                                            let _ = tauri::Emitter::emit(
+                                                &app2,
+                                                "notification:open",
+                                                &t,
+                                            );
+                                        }
+                                    });
                                 }
                             }
                         })
@@ -503,6 +523,7 @@ fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = target;
         use tauri_plugin_notification::NotificationExt;
         if let Err(e) = app.notification().builder().title(title).body(body).show() {
             tracing::warn!(error = %format!("{e:#}"), "show notification failed");

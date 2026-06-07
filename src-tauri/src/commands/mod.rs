@@ -19,8 +19,7 @@ pub use compose::{
     OutgoingAttachment, SaveDraftRequest, SendRequest,
 };
 pub use prefs::{
-    load_runtime_prefs, set_runtime_prefs, take_pending_open, NotificationPrefs,
-    PendingOpen, RuntimePrefs,
+    load_runtime_prefs, set_runtime_prefs, NotificationPrefs, RuntimePrefs,
 };
 pub use scheduled::{
     cancel_scheduled, list_scheduled, schedule_send, ScheduleSendRequest,
@@ -75,10 +74,6 @@ pub struct AppState {
     /// the user with notifications for mail that was already in the inbox at
     /// startup); subsequent passes notify normally.
     pub notify_warmed: AtomicBool,
-    /// The message a fresh single-message notification points at. The frontend
-    /// drains this (via `take_pending_open`) when the window regains focus, so
-    /// returning to the app after a notification jumps straight to the message.
-    pub pending_open: Mutex<Option<prefs::PendingOpen>>,
 }
 
 #[derive(Debug, Serialize, Clone)]

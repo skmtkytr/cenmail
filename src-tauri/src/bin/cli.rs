@@ -267,7 +267,6 @@ fn build_state() -> Result<AppState> {
         close_to_tray: std::sync::atomic::AtomicBool::new(true),
         quitting: std::sync::atomic::AtomicBool::new(false),
         notify_warmed: std::sync::atomic::AtomicBool::new(false),
-        pending_open: Mutex::new(None),
     })
 }
 

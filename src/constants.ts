@@ -26,11 +26,6 @@ export const MESSAGES_CHANGED_DEBOUNCE_MS = 300;
 /// Re-arm the search query after the user stops typing.
 export const SEARCH_DEBOUNCE_MS = 200;
 
-/// A notification's deep-link target is only honoured if the window regains
-/// focus within this window of the notification firing — older targets are
-/// treated as stale (the user came back for some other reason).
-export const NOTIFY_OPEN_FRESHNESS_MS = 30_000;
-
 // ── Virtualized list ─────────────────────────────────────────────────
 
 /// All message rows render at this height so the windowing layer

@@ -12,7 +12,6 @@ import { createStore } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   cacheKey,
   classifyBucket,
@@ -29,7 +28,6 @@ import {
   type ComposeState,
   type MessageDetail,
   type MessageMeta,
-  type PendingOpen,
   type SyncDone,
   type SyncError,
   type SyncProgress,
@@ -65,7 +63,6 @@ import {
   DRAFT_STORAGE_KEY,
   LIST_RELOAD_DEBOUNCE_MS,
   MESSAGES_CHANGED_DEBOUNCE_MS,
-  NOTIFY_OPEN_FRESHNESS_MS,
   PANE_DEFAULTS,
   PANE_MAX,
   PANE_MIN,
@@ -503,12 +500,13 @@ function App() {
     // Mirror notification + tray prefs to the backend so the timer can act on
     // them while the window (and its localStorage) is closed.
     void pushRuntimePrefs(settings());
-    // When the window regains focus after a backend notification, jump to the
-    // message it pointed at.
+    // The backend raises the window on a notification click and emits this with
+    // the target message; jump straight to it.
     unlistenFns.push(
-      await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-        if (focused) void openFromNotification();
-      }),
+      await listen<{ accountEmail: string; messageId: string }>(
+        "notification:open",
+        (e) => void openFromNotification(e.payload),
+      ),
     );
     // Seed the sidebar badges before the first sync completes.
     void refreshUnreadCounts();
@@ -516,22 +514,13 @@ function App() {
     void syncAll();
   });
 
-  // Deep-link from a backend notification: drain the pending target and, if it
-  // is fresh, switch to its account/inbox and select the message. Consumed on
-  // window focus so returning to the app (via the notification or the tray)
-  // lands on the new mail.
-  async function openFromNotification() {
-    let target: PendingOpen | null = null;
-    try {
-      target = await invoke<PendingOpen | null>("take_pending_open");
-    } catch {
-      return;
-    }
-    if (!target) return;
-    if (Date.now() - target.firedAtMs > NOTIFY_OPEN_FRESHNESS_MS) return;
-    const acct = (accounts() ?? []).find(
-      (a) => a.email === target!.accountEmail,
-    );
+  // Deep-link from a backend notification click: switch to the target's
+  // account/inbox and select the message.
+  async function openFromNotification(target: {
+    accountEmail: string;
+    messageId: string;
+  }) {
+    const acct = (accounts() ?? []).find((a) => a.email === target.accountEmail);
     batch(() => {
       setSelectedAccount(acct ? acct.id : "all");
       setSelectedFolder("inbox");
@@ -543,10 +532,10 @@ function App() {
         folder: "inbox",
         limit: 200,
       });
-      const meta = list.find((m) => m.id === target!.messageId);
+      const meta = list.find((m) => m.id === target.messageId);
       if (meta) await selectMessage(meta);
     } catch {
-      // best-effort: the window is already focused; nav is a nicety.
+      // best-effort: the window is already up; nav is a nicety.
     }
   }
 
