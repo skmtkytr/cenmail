@@ -451,24 +451,40 @@ fn notify_new_mail(app: &tauri::AppHandle) -> anyhow::Result<()> {
 
 /// Fire a desktop notification.
 ///
-/// On Linux we go straight to notify-rust instead of the Tauri plugin: the
-/// plugin omits the `desktop-entry` hint, so KDE/Plasma shows the toast but
-/// drops it from the notification history. Setting it to our installed
-/// `.desktop` id restores history retention and proper app identity/icon.
+/// On Linux we go straight to notify-rust instead of the Tauri plugin for two
+/// reasons: the plugin omits the `desktop-entry` hint (so KDE/Plasma drops the
+/// toast from its history), and it gives no way to react to a click. We attach
+/// a "default" action — invoked when the user clicks the notification body —
+/// and on click reveal the window. Revealing focuses it, which lets the
+/// frontend's focus listener drain `pending_open` and jump to the message.
+/// KDE hands an activation token to the action, so the raise actually works on
+/// Wayland (unlike a background set_focus).
 fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) {
     #[cfg(target_os = "linux")]
     {
-        let _ = app;
+        let app = app.clone();
         let title = title.to_string();
         let body = body.to_string();
-        // show() blocks on a D-Bus round-trip; run it off the main thread.
-        tauri::async_runtime::spawn(async move {
-            let _ = notify_rust::Notification::new()
+        // Dedicated thread: wait_for_action blocks until the notification is
+        // clicked or closed (it drives notify-rust's own event loop), so it
+        // must not sit on a tauri/tokio worker.
+        std::thread::spawn(move || {
+            match notify_rust::Notification::new()
                 .summary(&title)
                 .body(&body)
                 .appname("cenmail")
                 .hint(notify_rust::Hint::DesktopEntry("dev.cenmail.app".to_string()))
-                .show();
+                .action("default", "Open")
+                .show()
+            {
+                Ok(handle) => handle.wait_for_action(|action| {
+                    if action == "default" {
+                        let app2 = app.clone();
+                        let _ = app.run_on_main_thread(move || show_main_window(&app2));
+                    }
+                }),
+                Err(e) => tracing::warn!(error = %e, "show notification failed"),
+            }
         });
     }
     #[cfg(not(target_os = "linux"))]
