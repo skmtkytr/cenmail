@@ -126,20 +126,20 @@ pub fn run() {
             // the background timer keeps syncing and firing notifications. The
             // tray "Quit" item flips `quitting` first to allow a real exit.
             //
-            // We *minimize* rather than hide(): on Wayland, hide() unmaps the
-            // surface and the compositor re-places it (KWin centers it) on the
-            // next show, losing the user's window position. Minimizing keeps
-            // the toplevel mapped so unminimize restores the same geometry.
-            // skip_taskbar drops the taskbar entry while it's tucked away
-            // (best-effort — Wayland compositors may ignore it).
+            // Hide (not minimize): hide() unmaps the surface, so show() re-maps
+            // a fresh toplevel the compositor reliably brings to front — KWin
+            // won't deiconify+activate a *minimized* window from a background
+            // context (tray/notification). The cost is that KWin treats the
+            // re-mapped window as new and re-centers it (Wayland forbids client
+            // positioning); the `rememberwindowpositions` KWin script restores
+            // the prior position by hooking that same windowAdded event.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<AppState>();
                 let quitting = state.quitting.load(Ordering::Relaxed);
                 let close_to_tray = state.close_to_tray.load(Ordering::Relaxed);
                 if close_to_tray && !quitting {
                     api.prevent_close();
-                    let _ = window.set_skip_taskbar(true);
-                    let _ = window.minimize();
+                    let _ = window.hide();
                 }
             }
         })
@@ -227,15 +227,20 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Reveal and focus the main window, restoring it if it was minimized to the
-/// tray. Mirror of the close handler: undo skip_taskbar, then unminimize in
-/// place (which keeps the window's last position). Must run on the main thread.
+/// Reveal and focus the main window after it was hidden to the tray. show()
+/// re-maps the surface; GTK present() additionally raises and focuses it
+/// (Tauri's set_focus alone left it unfocused — the close button unresponsive
+/// — on KWin). Must run on the main thread (GTK calls).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.set_skip_taskbar(false);
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
+        #[cfg(target_os = "linux")]
+        if let Ok(gtk_win) = win.gtk_window() {
+            use gtk::prelude::GtkWindowExt;
+            gtk_win.present();
+        }
     }
 }
 
@@ -465,24 +470,33 @@ fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) {
         let app = app.clone();
         let title = title.to_string();
         let body = body.to_string();
-        // Dedicated thread: wait_for_action blocks until the notification is
-        // clicked or closed (it drives notify-rust's own event loop), so it
-        // must not sit on a tauri/tokio worker.
-        std::thread::spawn(move || {
-            match notify_rust::Notification::new()
+        // Drive the notification's async API on the tokio runtime. notify-rust's
+        // zbus is async-io backed (runtime-agnostic), so awaiting here is fine —
+        // and avoids the sync `block_on`, which silently failed to deliver the
+        // click action when run off a std thread.
+        tauri::async_runtime::spawn(async move {
+            let mut notification = notify_rust::Notification::new();
+            notification
                 .summary(&title)
                 .body(&body)
                 .appname("cenmail")
                 .hint(notify_rust::Hint::DesktopEntry("dev.cenmail.app".to_string()))
-                .action("default", "Open")
-                .show()
-            {
-                Ok(handle) => handle.wait_for_action(|action| {
-                    if action == "default" {
-                        let app2 = app.clone();
-                        let _ = app.run_on_main_thread(move || show_main_window(&app2));
-                    }
-                }),
+                .action("default", "Open");
+            match notification.show_async().await {
+                Ok(handle) => {
+                    handle
+                        .wait_for_action_async(|action| {
+                            if let notify_rust::ActionResponse::Custom(name) = action {
+                                if *name == "default" {
+                                    tracing::info!("notification clicked; revealing window");
+                                    let app2 = app.clone();
+                                    let _ = app
+                                        .run_on_main_thread(move || show_main_window(&app2));
+                                }
+                            }
+                        })
+                        .await;
+                }
                 Err(e) => tracing::warn!(error = %e, "show notification failed"),
             }
         });

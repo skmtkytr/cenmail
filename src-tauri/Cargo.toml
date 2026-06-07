@@ -55,3 +55,8 @@ urlencoding = "2.1.3"
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
 
+# Linux-only: drive the GTK window directly to deiconify+raise on restore,
+# since Tauri's unminimize/set_focus don't reliably do it on KWin/Wayland.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
