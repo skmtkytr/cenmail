@@ -26,6 +26,7 @@ import {
   snoozePresets,
   type Account,
   type ComposeState,
+  type MailtoFields,
   type MessageDetail,
   type MessageMeta,
   type SyncDone,
@@ -508,6 +509,20 @@ function App() {
         (e) => void openFromNotification(e.payload),
       ),
     );
+    // mailto: link handled while already running (single-instance forwarded it).
+    unlistenFns.push(
+      await listen<MailtoFields>(
+        "compose:mailto",
+        (e) => openComposeWith(e.payload),
+      ),
+    );
+    // mailto: link that launched cenmail this session (drained once).
+    try {
+      const launched = await invoke<MailtoFields | null>("take_pending_compose");
+      if (launched) openComposeWith(launched);
+    } catch {
+      // best-effort
+    }
     // Seed the sidebar badges before the first sync completes.
     void refreshUnreadCounts();
     // Start background sync of all accounts on first load.
@@ -792,6 +807,26 @@ function App() {
       in_reply_to: null,
       references: null,
       show_cc_bcc: false,
+      rich: settings().compose.richTextDefault,
+      attachments: [],
+    });
+  }
+
+  // Open a compose pre-filled from a mailto: link (OS mail handler).
+  function openComposeWith(fields: MailtoFields) {
+    setSendError(null);
+    bumpComposeSession();
+    const acct = defaultFromAccount();
+    setCompose({
+      from_account: acct,
+      to: fields.to ?? "",
+      cc: fields.cc ?? "",
+      bcc: fields.bcc ?? "",
+      subject: fields.subject ?? "",
+      body: fields.body || bodyWithSignature(settings(), acct),
+      in_reply_to: null,
+      references: null,
+      show_cc_bcc: !!(fields.cc || fields.bcc),
       rich: settings().compose.richTextDefault,
       attachments: [],
     });

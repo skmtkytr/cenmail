@@ -78,6 +78,15 @@ export type SyncProgress = { email: string; fetched: number; total: number };
 export type SyncDone = { email: string; total: number };
 export type SyncError = { email: string; error: string };
 
+/// Compose fields parsed from a `mailto:` link by the backend.
+export type MailtoFields = {
+  to: string;
+  cc: string;
+  bcc: string;
+  subject: string;
+  body: string;
+};
+
 export type SyncState = {
   fetched: number;
   total: number;

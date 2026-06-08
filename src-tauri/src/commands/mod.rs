@@ -74,6 +74,19 @@ pub struct AppState {
     /// the user with notifications for mail that was already in the inbox at
     /// startup); subsequent passes notify normally.
     pub notify_warmed: AtomicBool,
+    /// A `mailto:` URL the GUI was launched with, parsed into compose fields.
+    /// Drained once by the frontend on mount (`take_pending_compose`).
+    pub pending_compose: Mutex<Option<crate::mailto::ComposeFields>>,
+}
+
+/// Drain the launch-time mailto compose (if any). The frontend calls this on
+/// mount so a `mailto:` link that started cenmail opens a pre-filled compose.
+#[tauri::command]
+pub fn take_pending_compose(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::mailto::ComposeFields>, String> {
+    let mut guard = state.pending_compose.lock().map_err(|e| e.to_string())?;
+    Ok(guard.take())
 }
 
 #[derive(Debug, Serialize, Clone)]

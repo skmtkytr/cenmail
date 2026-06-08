@@ -5,6 +5,7 @@ pub mod constants;
 pub mod db;
 pub mod gcal;
 pub mod gmail;
+pub mod mailto;
 pub mod notify;
 mod oauth;
 pub mod secret;
@@ -24,6 +25,7 @@ use commands::{
     list_messages, list_scheduled, list_snoozed, modify_message, mute_thread,
     refresh_account, remove_account, respond_to_event, respond_to_invite, save_draft,
     schedule_send, send_draft, send_message, set_runtime_prefs, snooze_message, sync_account,
+    take_pending_compose,
     sync_calendar_events, trash_message, unmute_thread, unread_counts, unsnooze_message,
     untrash_message, update_event, AppState,
 };
@@ -67,6 +69,9 @@ pub fn run() {
         close_to_tray: AtomicBool::new(true),
         quitting: AtomicBool::new(false),
         notify_warmed: AtomicBool::new(false),
+        // A mailto: URL we were launched with (first launch). The frontend
+        // drains it on mount via `take_pending_compose`.
+        pending_compose: Mutex::new(mailto::mailto_from_args(std::env::args())),
     };
 
     tauri::Builder::default()
@@ -74,7 +79,12 @@ pub fn run() {
         // is still resident in the tray, the second process exits and this
         // callback fires in the running instance — reveal its window instead
         // of spawning a duplicate (which would double the timer/tray/notifs).
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A second launch may be the OS handing us a mailto: link; the
+            // running instance opens a pre-filled compose for it.
+            if let Some(fields) = mailto::mailto_from_args(argv) {
+                let _ = tauri::Emitter::emit(app, "compose:mailto", &fields);
+            }
             reveal_window_deferred(app);
         }))
         .plugin(tauri_plugin_opener::init())
@@ -178,6 +188,7 @@ pub fn run() {
             update_event,
             delete_event,
             set_runtime_prefs,
+            take_pending_compose,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
